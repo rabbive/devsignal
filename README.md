@@ -70,6 +70,117 @@ Host detection prefers **AppKit** (`NSWorkspace` / `NSRunningApplication`). If t
 - `[[agents]]`: `process_names` match **case-insensitively** against the `sysinfo` process name **or** the **basename of argv0** (so wrapped CLIs like `node …/codex` can match `codex`). Optional `argv_substrings` narrow matches when non-empty (**case-insensitive** substring match on the full command line).
 - `priority`: **lower number wins** when multiple agents match.
 
+## Architecture
+
+The repo is a **Rust workspace**: shared logic in `devsignal-core`, macOS host detection in `devsignal-macos`, Discord IPC in `devsignal-discord`, and the `devsignal` CLI / main loop in `devsignal-daemon`.
+
+### Crate map
+
+```mermaid
+flowchart TB
+  subgraph ws [Cargo workspace]
+    daemon[devsignal-daemon binary devsignal]
+    core[devsignal-core]
+    discordCrate[devsignal-discord]
+    macosCrate[devsignal-macos]
+  end
+
+  daemon --> core
+  daemon --> discordCrate
+  daemon --> macosCrate
+  daemon --> sysinfo[sysinfo crate]
+  discordCrate --> core
+  discordCrate --> drp[discord-rich-presence crate]
+
+  subgraph external [Outside process]
+    discApp[Discord desktop app]
+    osProc[OS processes]
+    appKit[AppKit frontmost app]
+  end
+
+  daemon -->|poll PIDs argv| osProc
+  macosCrate -->|bundle id| appKit
+  discordCrate -->|local IPC| discApp
+```
+
+- **`devsignal-core`**: config (`toml`), agent rules, matching, `PresenceView`, debouncing — no UI, no Discord.
+- **`devsignal-macos`**: frontmost application / host surface on macOS (AppKit).
+- **`devsignal-discord`**: Rich Presence via `discord-rich-presence` → Discord **desktop** IPC.
+- **`devsignal-daemon`**: CLI (`run` / `validate` / `once`), main loop: processes → agent → optional CWD hint → bundle → presence → debounce → push or clear.
+
+### Runtime flow (`devsignal run`)
+
+```mermaid
+sequenceDiagram
+  participant Timer as Poll timer
+  participant Sys as sysinfo System
+  participant Core as devsignal-core
+  participant Mac as devsignal-macos
+  participant Deb as Debouncer
+  participant DRP as devsignal-discord
+  participant DC as Discord desktop
+
+  loop Every poll_interval_secs
+    Timer->>Sys: refresh processes
+    Sys->>Core: match agent rules by priority
+    Core->>Core: select_active_agent
+    opt show_cwd_basename
+      Sys->>Core: cwd redact basename
+    end
+    Mac->>Core: frontmost_bundle_id
+    Core->>Core: build_presence_view
+    Core->>Deb: should_push
+    Deb->>DRP: set_presence or clear
+    DRP->>DC: Unix socket IPC
+  end
+```
+
+On **SIGINT/SIGTERM**, the daemon clears Rich Presence for this Discord application, then exits.
+
+### Config and policy
+
+```mermaid
+flowchart LR
+  toml[config.toml] --> load[Config load and validate]
+  load --> agents[[agents rules]]
+  load --> discordSec[discord section]
+  load --> policy[poll min_push idle_mode cwd]
+  agents --> match[Process argv matcher]
+  policy --> loop[Daemon loop]
+  discordSec --> ipc[Rich Presence client_id]
+```
+
+### Build and release
+
+```mermaid
+flowchart LR
+  src[Source on main]
+  ci[GitHub Actions CI]
+  tag[Git tag v*]
+  rel[Release workflow]
+  uni[lipo universal binary]
+  tb[tar.gz and plist]
+  gh[GitHub Release]
+
+  src --> ci
+  src --> tag
+  tag --> rel
+  rel --> uni
+  uni --> tb
+  tb --> gh
+```
+
+CI runs **fmt** and **clippy** (Linux exercises Linux-safe crates; macOS runs the **full** workspace). Pushing a **`v*`** tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml): cross-compile **aarch64** and **x86_64**, **`lipo`** a universal `devsignal`, package `devsignal-<version>-macos-universal.tar.gz` and attach the example LaunchAgent plist to the release.
+
+### Extension points
+
+| Area | Today | Natural next step |
+| --- | --- | --- |
+| Host OS | macOS-only host code in `devsignal-macos` | Separate crate + shared traits in core for other platforms |
+| Agents | TOML `process_names` / `argv_substrings` | More rules or config reload |
+| Discord | Local IPC to desktop client | Unchanged for Rich Presence; assets stay in the Developer Portal |
+| Distribution | Unsigned release binary in CI | Optional `codesign` / `notarytool` for Gatekeeper-friendly installs |
+
 ## LaunchAgent (login item)
 
 Use an absolute path to the `devsignal` binary in the plist **ProgramArguments**.
