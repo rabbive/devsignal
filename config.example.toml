@@ -20,6 +20,7 @@ large_text = "devsignal"
 id = "claude_code"
 label = "Claude Code"
 process_names = ["claude", "claude-code"]
+# Optional; if non-empty, at least one substring must appear in the full argv (case-insensitive).
 argv_substrings = []
 large_image = "claude"
 priority = 10
@@ -28,6 +29,7 @@ priority = 10
 id = "codex"
 label = "Codex"
 process_names = ["codex"]
+# Optional; if non-empty, at least one substring must appear in the full argv (case-insensitive).
 argv_substrings = []
 large_image = "codex"
 priority = 20
@@ -36,6 +38,7 @@ priority = 20
 id = "opencode"
 label = "OpenCode"
 process_names = ["opencode"]
+# Optional; if non-empty, at least one substring must appear in the full argv (case-insensitive).
 argv_substrings = []
 large_image = "opencode"
 priority = 30

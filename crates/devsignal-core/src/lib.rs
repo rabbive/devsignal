@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -67,7 +67,7 @@ pub struct AgentRule {
     /// `sysinfo` process names to match (case-insensitive).
     #[serde(default)]
     pub process_names: Vec<String>,
-    /// If non-empty, require at least one of these substrings in the command line.
+    /// If non-empty, require at least one of these substrings in the command line (case-insensitive).
     #[serde(default)]
     pub argv_substrings: Vec<String>,
     /// Discord `large_image` key for this agent (falls back to global).
@@ -96,7 +96,7 @@ impl Config {
         base.join("devsignal").join("config.toml")
     }
 
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(
             !self.discord.client_id.trim().is_empty(),
             "discord.client_id must be set"
@@ -113,7 +113,7 @@ pub struct ActiveAgent {
     pub large_image: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PresenceView {
     pub details: String,
     pub state: String,
@@ -160,31 +160,45 @@ impl Debouncer {
     }
 }
 
+/// Known bundle id → short label for Discord `state` (editors, terminals, JetBrains SKUs).
+pub const HOST_BUNDLE_LABELS: &[(&str, &str)] = &[
+    ("com.todesktop.230313mzl4w4u92", "Cursor"),
+    ("com.microsoft.VSCode", "VS Code"),
+    ("com.vscodium", "VSCodium"),
+    ("dev.zed.Zed", "Zed"),
+    ("com.apple.dt.Xcode", "Xcode"),
+    ("com.sublimetext.4", "Sublime Text"),
+    ("com.sublimetext.3", "Sublime Text"),
+    ("com.panic.Nova", "Nova"),
+    ("com.jetbrains.fleet", "Fleet"),
+    ("com.jetbrains.intellij", "IntelliJ IDEA"),
+    ("com.jetbrains.pycharm", "PyCharm"),
+    ("com.jetbrains.WebStorm", "WebStorm"),
+    ("com.jetbrains.goland", "GoLand"),
+    ("com.jetbrains.rubymine", "RubyMine"),
+    ("com.jetbrains.clion", "CLion"),
+    ("com.jetbrains.phpstorm", "PhpStorm"),
+    ("com.jetbrains.rustrover", "RustRover"),
+    ("com.jetbrains.datagrip", "DataGrip"),
+    ("com.jetbrains.aqua", "Aqua"),
+    ("com.apple.Terminal", "Terminal"),
+    ("com.googlecode.iterm2", "iTerm2"),
+    ("dev.warp.Warp-Stable", "Warp"),
+    ("com.mitchellh.ghostty", "Ghostty"),
+    ("net.kovidgoyal.kitty", "Kitty"),
+    ("org.alacritty.Alacritty", "Alacritty"),
+    ("co.zeit.hyper", "Hyper"),
+    ("com.raphaelamorim.tabby", "Tabby"),
+    ("com.github.wez.wezterm", "WezTerm"),
+];
+
 /// Map common macOS bundle IDs to a short host label for Discord `state`.
 /// Covers Tier A/B editors plus common terminals (Tier C).
 pub fn host_label_for_bundle(bundle_id: &str) -> String {
-    let map: HashMap<&str, &str> = [
-        ("com.todesktop.230313mzl4w4u92", "Cursor"),
-        ("com.microsoft.VSCode", "VS Code"),
-        ("com.vscodium", "VSCodium"),
-        ("dev.zed.Zed", "Zed"),
-        ("com.apple.dt.Xcode", "Xcode"),
-        ("com.sublimetext.4", "Sublime Text"),
-        ("com.sublimetext.3", "Sublime Text"),
-        ("com.panic.Nova", "Nova"),
-        ("com.jetbrains.fleet", "Fleet"),
-        ("com.apple.Terminal", "Terminal"),
-        ("com.googlecode.iterm2", "iTerm2"),
-        ("dev.warp.Warp-Stable", "Warp"),
-        ("com.mitchellh.ghostty", "Ghostty"),
-        ("net.kovidgoyal.kitty", "Kitty"),
-        ("org.alacritty.Alacritty", "Alacritty"),
-    ]
-    .into_iter()
-    .collect();
-
-    if let Some(l) = map.get(bundle_id) {
-        return (*l).to_string();
+    for (id, label) in HOST_BUNDLE_LABELS {
+        if *id == bundle_id {
+            return (*label).to_string();
+        }
     }
     if bundle_id.starts_with("com.jetbrains.") || bundle_id.contains("jetbrains") {
         return "JetBrains".to_string();
@@ -193,6 +207,40 @@ pub fn host_label_for_bundle(bundle_id: &str) -> String {
         return "Android Studio".to_string();
     }
     bundle_id.to_string()
+}
+
+/// Match a process against an agent rule: `process_names` vs process `name` (case-insensitive)
+/// or vs the **basename** of `cmd[0]` (for wrapped CLIs, e.g. `node …/codex.js`), then optional
+/// `argv_substrings` against the full command line (case-insensitive).
+pub fn process_matches_rule(name: &str, cmd: &[impl AsRef<OsStr>], rule: &AgentRule) -> bool {
+    let name_l = name.to_lowercase();
+    let name_hit = rule
+        .process_names
+        .iter()
+        .any(|n| n.to_lowercase() == name_l);
+    let argv0_hit = cmd.first().is_some_and(|a| {
+        let base = Path::new(a.as_ref())
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        let base_l = base.to_lowercase();
+        rule.process_names.iter().any(|n| n.to_lowercase() == base_l)
+    });
+    if !name_hit && !argv0_hit {
+        return false;
+    }
+    if rule.argv_substrings.is_empty() {
+        return true;
+    }
+    let joined = cmd
+        .iter()
+        .map(|s| s.as_ref().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let joined_l = joined.to_lowercase();
+    rule.argv_substrings
+        .iter()
+        .any(|needle| joined_l.contains(&needle.to_lowercase()))
 }
 
 /// Return a single directory name for presence text (last path segment). Never returns full paths.
@@ -273,14 +321,200 @@ pub fn build_presence_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
     use std::path::PathBuf;
+
+    fn sample_config() -> Config {
+        Config {
+            poll_interval_secs: 2,
+            min_push_interval_secs: 20,
+            idle_mode: IdleMode::Status,
+            show_cwd_basename: false,
+            discord: DiscordSection {
+                client_id: "123".to_string(),
+                large_image: "devsignal".to_string(),
+                large_text: "devsignal".to_string(),
+            },
+            agents: vec![],
+        }
+    }
+
+    fn rule(id: &str, priority: i32) -> AgentRule {
+        AgentRule {
+            id: id.to_string(),
+            label: None,
+            process_names: vec![],
+            argv_substrings: vec![],
+            large_image: None,
+            priority,
+        }
+    }
 
     #[test]
     fn redact_cwd_basename_last_segment() {
         let p = PathBuf::from("/Users/demo/projects/myapp");
-        assert_eq!(
-            redact_cwd_basename(&p).as_deref(),
-            Some("myapp")
+        assert_eq!(redact_cwd_basename(&p).as_deref(), Some("myapp"));
+    }
+
+    #[test]
+    fn debouncer_equal_payload_suppressed() {
+        let mut d = Debouncer::new(Duration::from_millis(100));
+        let v = PresenceView {
+            details: "A".into(),
+            state: "B".into(),
+            large_image: "x".into(),
+            large_text: "".into(),
+            start_timestamp_unix: None,
+        };
+        assert!(d.should_push(&v, true));
+        assert!(!d.should_push(&v, false));
+    }
+
+    #[test]
+    fn debouncer_new_payload_before_min_interval_suppressed() {
+        let mut d = Debouncer::new(Duration::from_millis(400));
+        let a = PresenceView {
+            details: "A".into(),
+            state: "s".into(),
+            large_image: "x".into(),
+            large_text: "".into(),
+            start_timestamp_unix: None,
+        };
+        let b = PresenceView {
+            details: "B".into(),
+            state: "s".into(),
+            large_image: "x".into(),
+            large_text: "".into(),
+            start_timestamp_unix: None,
+        };
+        assert!(d.should_push(&a, true));
+        assert!(!d.should_push(&b, false));
+        std::thread::sleep(Duration::from_millis(450));
+        assert!(d.should_push(&b, false));
+    }
+
+    #[test]
+    fn debouncer_force_always_pushes() {
+        let mut d = Debouncer::new(Duration::from_secs(60));
+        let v = PresenceView {
+            details: "A".into(),
+            state: "s".into(),
+            large_image: "x".into(),
+            large_text: "".into(),
+            start_timestamp_unix: None,
+        };
+        assert!(d.should_push(&v, true));
+        assert!(d.should_push(&v, true));
+    }
+
+    #[test]
+    fn select_active_agent_priority_and_pid_tiebreak() {
+        let r10 = rule("a", 10);
+        let r20 = rule("b", 20);
+        let out = select_active_agent(vec![
+            (r20.clone(), 100),
+            (r10.clone(), 200),
+        ]);
+        assert_eq!(out.as_ref().map(|(a, _)| a.id.as_str()), Some("a"));
+
+        let out2 = select_active_agent(vec![(r10.clone(), 50), (r10, 30)]);
+        assert_eq!(out2.map(|(_, pid)| pid), Some(30));
+    }
+
+    #[test]
+    fn select_active_agent_empty() {
+        assert!(select_active_agent(vec![]).is_none());
+    }
+
+    #[test]
+    fn build_presence_view_agent_and_idle() {
+        let mut cfg = sample_config();
+        let agent = ActiveAgent {
+            id: "x".into(),
+            label: "My Agent".into(),
+            large_image: "img".into(),
+        };
+        let v = build_presence_view(
+            &cfg,
+            Some(&agent),
+            Some("com.microsoft.VSCode"),
+            Some(99),
+            Some("proj"),
         );
+        assert_eq!(v.details, "My Agent");
+        assert_eq!(v.state, "In VS Code · proj");
+        assert_eq!(v.large_image, "img");
+        assert_eq!(v.start_timestamp_unix, Some(99));
+
+        let idle = build_presence_view(&cfg, None, None, None, None);
+        assert_eq!(idle.details, "Idle");
+        assert_eq!(idle.state, "macOS · no agent CLI detected");
+        assert_eq!(idle.large_image, cfg.discord.large_image);
+        assert!(idle.start_timestamp_unix.is_none());
+    }
+
+    #[test]
+    fn host_label_known_and_jetbrains_fallback() {
+        assert_eq!(host_label_for_bundle("com.microsoft.VSCode"), "VS Code");
+        assert_eq!(host_label_for_bundle("com.jetbrains.pycharm"), "PyCharm");
+        assert_eq!(host_label_for_bundle("com.jetbrains.unknownide"), "JetBrains");
+        assert_eq!(host_label_for_bundle("com.example.unknown"), "com.example.unknown");
+    }
+
+    #[test]
+    fn host_bundle_labels_include_hyper_tabby_wezterm() {
+        assert!(HOST_BUNDLE_LABELS.iter().any(|(id, _)| *id == "co.zeit.hyper"));
+        assert!(HOST_BUNDLE_LABELS
+            .iter()
+            .any(|(id, _)| *id == "com.github.wez.wezterm"));
+    }
+
+    #[test]
+    fn process_matches_rule_name_and_argv_case_insensitive() {
+        let r = AgentRule {
+            id: "t".into(),
+            label: None,
+            process_names: vec!["node".into()],
+            argv_substrings: vec!["CODEX".into()],
+            large_image: None,
+            priority: 0,
+        };
+        assert!(process_matches_rule(
+            "NODE",
+            &[OsStr::new("node"), OsStr::new("--codex")],
+            &r
+        ));
+        assert!(!process_matches_rule("ruby", &[OsStr::new("ruby")], &r));
+    }
+
+    #[test]
+    fn process_matches_rule_empty_argv_substrings() {
+        let r = AgentRule {
+            id: "t".into(),
+            label: None,
+            process_names: vec!["foo".into()],
+            argv_substrings: vec![],
+            large_image: None,
+            priority: 0,
+        };
+        let empty: &[&OsStr] = &[];
+        assert!(process_matches_rule("foo", empty, &r));
+    }
+
+    #[test]
+    fn process_matches_rule_argv0_basename_wrapped_cli() {
+        let r = AgentRule {
+            id: "codex".into(),
+            label: None,
+            process_names: vec!["codex".into()],
+            argv_substrings: vec![],
+            large_image: None,
+            priority: 0,
+        };
+        assert!(process_matches_rule(
+            "node",
+            &[OsStr::new("/usr/local/bin/codex")],
+            &r
+        ));
     }
 }

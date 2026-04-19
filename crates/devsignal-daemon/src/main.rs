@@ -1,13 +1,16 @@
 use anyhow::{Context, Result};
 use devsignal_core::{
-    build_presence_view, redact_cwd_basename, select_active_agent, Config, Debouncer, IdleMode,
+    build_presence_view, process_matches_rule, redact_cwd_basename, select_active_agent, Config,
+    Debouncer, IdleMode,
 };
 use devsignal_discord::{clear_presence_resilient, set_presence_resilient, PresenceSession};
-use std::ffi::OsString;
-use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
-use tracing::info;
+use tracing::{info, warn};
+
+static RUNNING: AtomicBool = AtomicBool::new(true);
 
 fn now_unix() -> u64 {
     SystemTime::now()
@@ -16,62 +19,119 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-fn parse_args() -> PathBuf {
-    let mut args = std::env::args().skip(1);
-    let mut path = Config::default_path();
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--config" | "-c" => {
-                if let Some(p) = args.next() {
-                    path = PathBuf::from(p);
-                } else {
-                    eprintln!("--config requires a path");
-                    std::process::exit(2);
-                }
-            }
-            "--help" | "-h" => {
-                eprintln!(
-                    "devsignal — unified Discord Rich Presence for AI coding CLIs\n\
-                     \n\
-                     Usage:\n\
-                       devsignal [--config path]\n\
-                     \n\
-                     Default config: {}",
-                    Config::default_path().display()
-                );
-                std::process::exit(0);
-            }
-            other => {
-                eprintln!("unknown argument: {other}");
-                std::process::exit(2);
-            }
-        }
-    }
-    path
+#[derive(Debug)]
+enum Cli {
+    Run(RunArgs),
+    Validate { config: PathBuf },
+    Once { config: PathBuf },
 }
 
-fn process_matches_rule(
-    name: &str,
-    cmd: &[OsString],
-    rule: &devsignal_core::AgentRule,
-) -> bool {
-    let name_l = name.to_lowercase();
-    let hit = rule.process_names.iter().any(|n| n.to_lowercase() == name_l);
-    if !hit {
-        return false;
+#[derive(Debug)]
+struct RunArgs {
+    config: PathBuf,
+    /// When true, retry Discord IPC until timeout if Discord is not running.
+    wait_for_discord: bool,
+}
+
+fn print_global_help() {
+    eprintln!(
+        "devsignal — unified Discord Rich Presence for AI coding CLIs (macOS)\n\
+         \n\
+         Usage:\n\
+           devsignal [run] [options]\n\
+           devsignal validate [--config path]\n\
+           devsignal once [--config path]\n\
+         \n\
+         Default config: {}\n\
+         \n\
+         Run options:\n\
+           -c, --config <path>     Config file (default: see above)\n\
+           --wait-for-discord      Retry until Discord is available (default)\n\
+           --no-wait-for-discord   Fail immediately if Discord IPC is unavailable\n",
+        Config::default_path().display()
+    );
+}
+
+fn parse_config_path_only(args: &[String]) -> Result<PathBuf> {
+    let mut path = Config::default_path();
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--config" | "-c" => {
+                let p = it
+                    .next()
+                    .context("--config requires a path")?;
+                path = PathBuf::from(p);
+            }
+            "--help" | "-h" => {
+                print_global_help();
+                std::process::exit(0);
+            }
+            other => anyhow::bail!("unknown argument: {other}"),
+        }
     }
-    if rule.argv_substrings.is_empty() {
-        return true;
+    Ok(path)
+}
+
+fn parse_run_args(args: &[String]) -> Result<RunArgs> {
+    let mut path = Config::default_path();
+    let mut wait_for_discord = true;
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--config" | "-c" => {
+                let p = it
+                    .next()
+                    .context("--config requires a path")?;
+                path = PathBuf::from(p);
+            }
+            "--wait-for-discord" => wait_for_discord = true,
+            "--no-wait-for-discord" => wait_for_discord = false,
+            "--help" | "-h" => {
+                print_global_help();
+                std::process::exit(0);
+            }
+            other => anyhow::bail!("unknown argument: {other}"),
+        }
     }
-    let joined = cmd
-        .iter()
-        .map(|s| s.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join(" ");
-    rule
-        .argv_substrings
-        .iter()
-        .any(|needle| joined.contains(needle))
+    Ok(RunArgs {
+        config: path,
+        wait_for_discord,
+    })
+}
+
+fn parse_cli() -> Result<Cli> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() {
+        return Ok(Cli::Run(RunArgs {
+            config: Config::default_path(),
+            wait_for_discord: true,
+        }));
+    }
+    match args[0].as_str() {
+        "validate" => {
+            let rest = &args[1..];
+            Ok(Cli::Validate {
+                config: parse_config_path_only(rest)?,
+            })
+        }
+        "once" => {
+            let rest = &args[1..];
+            Ok(Cli::Once {
+                config: parse_config_path_only(rest)?,
+            })
+        }
+        "run" => {
+            let rest = &args[1..];
+            Ok(Cli::Run(parse_run_args(rest)?))
+        }
+        "help" | "--help" | "-h" => {
+            print_global_help();
+            std::process::exit(0);
+        }
+        // Legacy: `devsignal --config foo` without subcommand
+        _ => Ok(Cli::Run(parse_run_args(&args)?)),
+    }
 }
 
 fn collect_matches(sys: &System, cfg: &Config) -> Vec<(devsignal_core::AgentRule, u32)> {
@@ -86,6 +146,66 @@ fn collect_matches(sys: &System, cfg: &Config) -> Vec<(devsignal_core::AgentRule
         }
     }
     out
+}
+
+fn connect_with_wait(session: &mut PresenceSession, wait: bool) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut sleep_dur = Duration::from_millis(400);
+    loop {
+        match session.connect() {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if !wait || Instant::now() >= deadline {
+                    return Err(e).context("connect to Discord IPC (is Discord running?)");
+                }
+                warn!(error = %e, "Discord not reachable; retrying IPC");
+                std::thread::sleep(sleep_dur);
+                sleep_dur = (sleep_dur * 2).min(Duration::from_secs(4));
+            }
+        }
+    }
+}
+
+fn cmd_validate(config_path: &Path) -> Result<()> {
+    if !config_path.exists() {
+        anyhow::bail!("config not found at {}", config_path.display());
+    }
+    let cfg = Config::load_from_path(config_path).context("load config")?;
+    println!("OK: {}", config_path.display());
+    println!("discord.client_id: {}", cfg.discord.client_id);
+    for a in &cfg.agents {
+        println!(
+            "  [[agents]] id={} label={:?} priority={} process_names={:?} argv_substrings={:?}",
+            a.id, a.label, a.priority, a.process_names, a.argv_substrings
+        );
+    }
+    Ok(())
+}
+
+fn cmd_once(config_path: &Path) -> Result<()> {
+    if !config_path.exists() {
+        anyhow::bail!("config not found at {}", config_path.display());
+    }
+    let cfg = Config::load_from_path(config_path).context("load config")?;
+    let mut sys = System::new();
+    sys.refresh_specifics(
+        RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
+    );
+    let matches = collect_matches(&sys, &cfg);
+    let selected = select_active_agent(matches);
+    let bundle = devsignal_macos::frontmost_bundle_id();
+    let view = build_presence_view(
+        &cfg,
+        selected.as_ref().map(|(a, _)| a),
+        bundle.as_deref(),
+        None,
+        None,
+    );
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&view).context("serialize presence view")?
+    );
+    Ok(())
 }
 
 fn main() {
@@ -104,14 +224,79 @@ fn main() {
 
     #[cfg(target_os = "macos")]
     {
-        match startup() {
-            Ok(state) => run_forever(state),
+        let cli = match parse_cli() {
+            Ok(c) => c,
             Err(e) => {
                 eprintln!("{e:#}");
-                std::process::exit(1);
+                std::process::exit(2);
             }
-        }
+        };
+
+        let code = match cli {
+            Cli::Validate { config } => match cmd_validate(&config) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("{e:#}");
+                    1
+                }
+            },
+            Cli::Once { config } => match cmd_once(&config) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("{e:#}");
+                    1
+                }
+            },
+            Cli::Run(args) => match run_daemon(args) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("{e:#}");
+                    1
+                }
+            },
+        };
+        std::process::exit(code);
     }
+}
+
+#[cfg(target_os = "macos")]
+fn run_daemon(args: RunArgs) -> Result<()> {
+    let _ = ctrlc::set_handler(|| {
+        RUNNING.store(false, Ordering::SeqCst);
+    });
+
+    if !args.config.exists() {
+        anyhow::bail!(
+            "config not found at {}\n\
+             Copy config.example.toml to that path and set discord.client_id.",
+            args.config.display()
+        );
+    }
+
+    let cfg = Config::load_from_path(&args.config).context("load config")?;
+    let poll = Duration::from_secs(cfg.poll_interval_secs.max(1));
+    let debounce_min = Duration::from_secs(cfg.min_push_interval_secs.max(1));
+
+    let mut session = PresenceSession::new(cfg.discord.client_id.clone());
+    connect_with_wait(&mut session, args.wait_for_discord).context("ipc connect")?;
+
+    let sys = System::new();
+    let debouncer = Debouncer::new(debounce_min);
+
+    info!(config = %args.config.display(), "devsignal running");
+
+    let state = RunState {
+        cfg,
+        session,
+        sys,
+        debouncer,
+        last_agent_id: None,
+        session_start_unix: None,
+        poll,
+        first_tick: true,
+    };
+    run_forever(state);
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -127,43 +312,8 @@ struct RunState {
 }
 
 #[cfg(target_os = "macos")]
-fn startup() -> Result<RunState> {
-    let cfg_path = parse_args();
-    if !cfg_path.exists() {
-        anyhow::bail!(
-            "config not found at {}\n\
-             Copy config.example.toml to that path and set discord.client_id.",
-            cfg_path.display()
-        );
-    }
-
-    let cfg = Config::load_from_path(&cfg_path).context("load config")?;
-    let poll = Duration::from_secs(cfg.poll_interval_secs.max(1));
-    let debounce_min = Duration::from_secs(cfg.min_push_interval_secs.max(1));
-
-    let mut session = PresenceSession::new(cfg.discord.client_id.clone());
-    session.connect().context("ipc connect")?;
-
-    let sys = System::new();
-    let debouncer = Debouncer::new(debounce_min);
-
-    info!(config = %cfg_path.display(), "devsignal running");
-
-    Ok(RunState {
-        cfg,
-        session,
-        sys,
-        debouncer,
-        last_agent_id: None,
-        session_start_unix: None,
-        poll,
-        first_tick: true,
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn run_forever(mut state: RunState) -> ! {
-    loop {
+fn run_forever(mut state: RunState) {
+    while RUNNING.load(Ordering::SeqCst) {
         state.sys.refresh_specifics(
             RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
         );
@@ -224,4 +374,6 @@ fn run_forever(mut state: RunState) -> ! {
         state.first_tick = false;
         std::thread::sleep(state.poll);
     }
+
+    clear_presence_resilient(&mut state.session);
 }

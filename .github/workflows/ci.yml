@@ -9,7 +9,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  rust:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,6 +21,19 @@ jobs:
 
       - name: cargo fmt
         run: cargo fmt --all -- --check
+
+      - name: cargo clippy (linux-safe crates)
+        run: cargo clippy -p devsignal-core -p devsignal-discord --all-targets -- -D warnings
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings

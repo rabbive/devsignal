@@ -7,14 +7,13 @@ use tracing::warn;
 
 pub struct PresenceSession {
     client: DiscordIpcClient,
-    client_id: String,
 }
 
 impl PresenceSession {
     pub fn new(client_id: impl Into<String>) -> Self {
         let client_id = client_id.into();
         let client = DiscordIpcClient::new(&client_id);
-        Self { client, client_id }
+        Self { client }
     }
 
     pub fn connect(&mut self) -> Result<()> {
