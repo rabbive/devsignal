@@ -1,0 +1,41 @@
+# Copy to: ~/.config/devsignal/config.toml
+# Create a Discord application and use its "Application ID" as client_id.
+# Upload matching image keys (e.g. claude, codex, opencode) under Rich Presence → Art Assets.
+
+poll_interval_secs = 2
+min_push_interval_secs = 20
+
+# When no agent is running: "status" shows an Idle line; "clear" removes Rich Presence for this app.
+idle_mode = "status"
+
+# If true, append the working-directory basename of the winning agent process (never full paths).
+show_cwd_basename = false
+
+[discord]
+client_id = "YOUR_DISCORD_APPLICATION_ID"
+large_image = "devsignal"
+large_text = "devsignal"
+
+[[agents]]
+id = "claude_code"
+label = "Claude Code"
+process_names = ["claude", "claude-code"]
+argv_substrings = []
+large_image = "claude"
+priority = 10
+
+[[agents]]
+id = "codex"
+label = "Codex"
+process_names = ["codex"]
+argv_substrings = []
+large_image = "codex"
+priority = 20
+
+[[agents]]
+id = "opencode"
+label = "OpenCode"
+process_names = ["opencode"]
+argv_substrings = []
+large_image = "opencode"
+priority = 30

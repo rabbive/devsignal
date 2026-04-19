@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Example LaunchAgent for devsignal.
+
+  1. Build a release binary, e.g.:
+       cargo build --release -p devsignal-daemon
+     Binary: target/release/devsignal
+
+  2. Copy devsignal to a stable location, e.g.:
+       mkdir -p ~/bin && cp target/release/devsignal ~/bin/
+
+  3. Copy this file to:
+       ~/Library/LaunchAgents/com.devsignal.daemon.plist
+
+  4. Edit ProgramArguments[0] to the absolute path of your binary.
+
+  5. Create log directory:
+       mkdir -p ~/Library/Logs/devsignal
+
+  6. Load:
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.devsignal.daemon.plist
+
+  Unload:
+       launchctl bootout gui/$(id -u)/com.devsignal.daemon
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.devsignal.daemon</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/devsignal</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>REPLACE_HOME/Library/Logs/devsignal/devsignal.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>REPLACE_HOME/Library/Logs/devsignal/devsignal.err.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RUST_LOG</key>
+    <string>info</string>
+  </dict>
+</dict>
+</plist>

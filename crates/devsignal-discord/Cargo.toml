@@ -1,0 +1,12 @@
+[package]
+name = "devsignal-discord"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Discord Rich Presence IPC wrapper for devsignal"
+
+[dependencies]
+anyhow.workspace = true
+devsignal-core = { path = "../devsignal-core" }
+discord-rich-presence.workspace = true
+tracing.workspace = true

@@ -1,0 +1,6 @@
+[package]
+name = "devsignal-macos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "macOS host-surface detection for devsignal"
