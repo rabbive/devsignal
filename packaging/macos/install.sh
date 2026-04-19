@@ -3,16 +3,12 @@
 # scaffold config, optional LaunchAgent bootstrap.
 #
 # Usage:
-#   export DEVSIGNAL_GITHUB_REPO="yourname/devsignal"   # required
 #   ./install.sh [version]     # version defaults to latest release tag (without leading v)
+# Optional: DEVSIGNAL_GITHUB_REPO=owner/repo (default: rabbive/devsignal)
 #
 set -euo pipefail
 
-REPO="${DEVSIGNAL_GITHUB_REPO:-}"
-if [[ -z "$REPO" ]]; then
-  echo "Set DEVSIGNAL_GITHUB_REPO to 'owner/repo' (your fork or upstream)." >&2
-  exit 1
-fi
+REPO="${DEVSIGNAL_GITHUB_REPO:-rabbive/devsignal}"
 
 VERSION_INPUT="${1:-}"
 if [[ -n "$VERSION_INPUT" ]]; then

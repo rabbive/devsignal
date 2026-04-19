@@ -12,7 +12,7 @@ Unified **Discord Rich Presence** for AI coding CLIs on **macOS**. One daemon, o
 
 ## Quick start
 
-1. Copy `config.example.toml` to `~/.config/devsignal/config.toml`.
+1. Scaffold config (from repo root): `./scripts/setup-local-config.sh` — or copy `config.example.toml` to `~/.config/devsignal/config.toml` yourself.
 2. Set `discord.client_id` to your Application ID.
 3. Run a **release binary** (see below) or from source:
 
@@ -32,10 +32,10 @@ Leave **Discord desktop** open; the daemon talks to it over local IPC. If Discor
 
 ### Releases (prebuilt macOS universal binary)
 
-Tagged releases attach `devsignal-<version>-macos-universal.tar.gz` and the example LaunchAgent plist. Replace `OWNER` with your GitHub user or org:
+Tagged releases attach `devsignal-<version>-macos-universal.tar.gz` and the example LaunchAgent plist. Upstream:
 
 ```text
-https://github.com/OWNER/devsignal/releases/latest
+https://github.com/rabbive/devsignal/releases/latest
 ```
 
 Extract the tarball and place `devsignal` on your `PATH` (for example `~/bin/devsignal`).
@@ -45,7 +45,8 @@ Extract the tarball and place `devsignal` on your `PATH` (for example `~/bin/dev
 From a clone of this repo:
 
 ```bash
-export DEVSIGNAL_GITHUB_REPO="OWNER/devsignal"
+# Optional: override repo (default is rabbive/devsignal)
+# export DEVSIGNAL_GITHUB_REPO="yourfork/devsignal"
 chmod +x packaging/macos/install.sh
 ./packaging/macos/install.sh
 ```
@@ -54,7 +55,7 @@ This downloads the latest GitHub Release, installs to `~/bin/devsignal`, scaffol
 
 ### Homebrew (tap)
 
-Use [`packaging/homebrew/devsignal.rb`](packaging/homebrew/devsignal.rb) as a template in your own tap: set `OWNER`, `VERSION`, and `sha256` after publishing a release tarball.
+Use [`packaging/homebrew/devsignal.rb`](packaging/homebrew/devsignal.rb) as a template in your own tap: after the matching GitHub Release exists, set `sha256` via `shasum -a 256` on the downloaded `devsignal-<version>-macos-universal.tar.gz` (see comments in the formula).
 
 ### macOS permissions
 

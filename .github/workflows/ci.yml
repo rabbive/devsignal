@@ -7,6 +7,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Quieter Actions deprecation notice for checkout (Node 20 → 24); see GitHub changelog 2025-09-19.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   lint:
