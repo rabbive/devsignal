@@ -101,7 +101,10 @@ impl Config {
             !self.discord.client_id.trim().is_empty(),
             "discord.client_id must be set"
         );
-        anyhow::ensure!(!self.agents.is_empty(), "at least one [[agents]] entry is required");
+        anyhow::ensure!(
+            !self.agents.is_empty(),
+            "at least one [[agents]] entry is required"
+        );
         Ok(())
     }
 }
@@ -224,7 +227,9 @@ pub fn process_matches_rule(name: &str, cmd: &[impl AsRef<OsStr>], rule: &AgentR
             .and_then(|s| s.to_str())
             .unwrap_or("");
         let base_l = base.to_lowercase();
-        rule.process_names.iter().any(|n| n.to_lowercase() == base_l)
+        rule.process_names
+            .iter()
+            .any(|n| n.to_lowercase() == base_l)
     });
     if !name_hit && !argv0_hit {
         return false;
@@ -262,11 +267,7 @@ pub fn select_active_agent(mut matches: Vec<(AgentRule, u32)>) -> Option<(Active
     if matches.is_empty() {
         return None;
     }
-    matches.sort_by(|a, b| {
-        a.0.priority
-            .cmp(&b.0.priority)
-            .then_with(|| a.1.cmp(&b.1))
-    });
+    matches.sort_by(|a, b| a.0.priority.cmp(&b.0.priority).then_with(|| a.1.cmp(&b.1)));
     let (rule, pid) = matches.into_iter().next()?;
     let label = rule
         .label
@@ -411,10 +412,7 @@ mod tests {
     fn select_active_agent_priority_and_pid_tiebreak() {
         let r10 = rule("a", 10);
         let r20 = rule("b", 20);
-        let out = select_active_agent(vec![
-            (r20.clone(), 100),
-            (r10.clone(), 200),
-        ]);
+        let out = select_active_agent(vec![(r20.clone(), 100), (r10.clone(), 200)]);
         assert_eq!(out.as_ref().map(|(a, _)| a.id.as_str()), Some("a"));
 
         let out2 = select_active_agent(vec![(r10.clone(), 50), (r10, 30)]);
@@ -428,7 +426,7 @@ mod tests {
 
     #[test]
     fn build_presence_view_agent_and_idle() {
-        let mut cfg = sample_config();
+        let cfg = sample_config();
         let agent = ActiveAgent {
             id: "x".into(),
             label: "My Agent".into(),
@@ -457,13 +455,21 @@ mod tests {
     fn host_label_known_and_jetbrains_fallback() {
         assert_eq!(host_label_for_bundle("com.microsoft.VSCode"), "VS Code");
         assert_eq!(host_label_for_bundle("com.jetbrains.pycharm"), "PyCharm");
-        assert_eq!(host_label_for_bundle("com.jetbrains.unknownide"), "JetBrains");
-        assert_eq!(host_label_for_bundle("com.example.unknown"), "com.example.unknown");
+        assert_eq!(
+            host_label_for_bundle("com.jetbrains.unknownide"),
+            "JetBrains"
+        );
+        assert_eq!(
+            host_label_for_bundle("com.example.unknown"),
+            "com.example.unknown"
+        );
     }
 
     #[test]
     fn host_bundle_labels_include_hyper_tabby_wezterm() {
-        assert!(HOST_BUNDLE_LABELS.iter().any(|(id, _)| *id == "co.zeit.hyper"));
+        assert!(HOST_BUNDLE_LABELS
+            .iter()
+            .any(|(id, _)| *id == "co.zeit.hyper"));
         assert!(HOST_BUNDLE_LABELS
             .iter()
             .any(|(id, _)| *id == "com.github.wez.wezterm"));

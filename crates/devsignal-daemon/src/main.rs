@@ -58,9 +58,7 @@ fn parse_config_path_only(args: &[String]) -> Result<PathBuf> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--config" | "-c" => {
-                let p = it
-                    .next()
-                    .context("--config requires a path")?;
+                let p = it.next().context("--config requires a path")?;
                 path = PathBuf::from(p);
             }
             "--help" | "-h" => {
@@ -80,9 +78,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--config" | "-c" => {
-                let p = it
-                    .next()
-                    .context("--config requires a path")?;
+                let p = it.next().context("--config requires a path")?;
                 path = PathBuf::from(p);
             }
             "--wait-for-discord" => wait_for_discord = true,
@@ -188,9 +184,7 @@ fn cmd_once(config_path: &Path) -> Result<()> {
     }
     let cfg = Config::load_from_path(config_path).context("load config")?;
     let mut sys = System::new();
-    sys.refresh_specifics(
-        RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
-    );
+    sys.refresh_specifics(RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()));
     let matches = collect_matches(&sys, &cfg);
     let selected = select_active_agent(matches);
     let bundle = devsignal_macos::frontmost_bundle_id();
@@ -350,7 +344,7 @@ fn run_forever(mut state: RunState) {
                     .sys
                     .process(Pid::from_u32(*pid))
                     .and_then(|p| p.cwd())
-                    .and_then(|c| redact_cwd_basename(c))
+                    .and_then(redact_cwd_basename)
             })
         } else {
             None
