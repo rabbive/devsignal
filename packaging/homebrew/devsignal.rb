@@ -1,16 +1,13 @@
 # Homebrew formula template — copy into a tap repository (e.g. homebrew-tap).
-# After the matching GitHub Release exists, set sha256:
-#   curl -fsSL -o t.tgz "https://github.com/rabbive/devsignal/releases/download/v0.2.0/devsignal-0.2.0-macos-universal.tar.gz"
+# Future bumps: match url to release tag, then:
+#   curl -fsSL -o t.tgz "https://github.com/rabbive/devsignal/releases/download/vVERSION/devsignal-VERSION-macos-universal.tar.gz"
 #   shasum -a 256 t.tgz
-#
-#   brew install YOURTAP/devsignal
 #
 class Devsignal < Formula
   desc "Unified Discord Rich Presence for AI coding CLIs on macOS"
   homepage "https://github.com/rabbive/devsignal"
   url "https://github.com/rabbive/devsignal/releases/download/v0.2.0/devsignal-0.2.0-macos-universal.tar.gz"
-  # Replace with output of shasum after the v0.2.0 release tarball is published (placeholder fails brew until updated).
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "4c7b96fe6a1507c6bb286ba5fd4e24685de1830b4db86a126c87d4ee56461f08"
   license "MIT"
 
   depends_on macos: :mojave
