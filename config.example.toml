@@ -1,44 +1,61 @@
-# Copy to: ~/.config/devsignal/config.toml
-# Create a Discord application and use its "Application ID" as client_id.
-# Upload matching image keys (e.g. claude, codex, opencode) under Rich Presence → Art Assets.
+# devsignal example configuration
+# Copy to ~/.config/devsignal/config.toml and set discord.client_id.
 
-poll_interval_secs = 2
-min_push_interval_secs = 20
-
-# When no agent is running: "status" shows an Idle line; "clear" removes Rich Presence for this app.
-idle_mode = "status"
-
-# If true, append the working-directory basename of the winning agent process (never full paths).
-show_cwd_basename = false
+poll_interval_secs     = 2    # How often to scan running processes (seconds).
+min_push_interval_secs = 20   # Minimum time between Discord IPC pushes (reduces flicker).
+idle_mode              = "status"  # "status" = show Idle line; "clear" = hide presence entirely.
+show_cwd_basename      = false     # Show the basename of the agent's working directory. Off by default for privacy.
 
 [discord]
-client_id = "YOUR_DISCORD_APPLICATION_ID"
-large_image = "devsignal"
-large_text = "devsignal"
+# Your Discord Application ID from https://discord.com/developers/applications
+client_id   = "YOUR_DISCORD_APPLICATION_ID"
+large_image = "devsignal"   # Art asset key shown when no agent is detected (idle).
+large_text  = "devsignal"   # Hover tooltip for the idle large image.
+# small_image = "devsignal" # Optional: small corner icon shown during idle.
+# small_text  = "Idle"      # Optional: tooltip for the idle small icon.
+
+# ── Agent rules ────────────────────────────────────────────────────────────────
+# process_names: case-insensitive match against the sysinfo process name OR
+#                the basename of argv[0] (catches wrapped CLIs like "node .../codex").
+# argv_substrings: narrow matches when non-empty — all must appear in the command line.
+# priority: lower number wins when multiple agents match; ties break on lower PID.
+# buttons: up to 2 clickable buttons in the Discord presence panel.
 
 [[agents]]
-id = "claude_code"
-label = "Claude Code"
+id            = "claude_code"
+label         = "Claude Code"
 process_names = ["claude", "claude-code"]
-# Optional; if non-empty, at least one substring must appear in the full argv (case-insensitive).
-argv_substrings = []
-large_image = "claude"
-priority = 10
+priority      = 10
+large_image   = "claude"
+small_image   = "devsignal"
+small_text    = "devsignal"
+
+  [[agents.buttons]]
+  label = "Claude Code Docs"
+  url   = "https://claude.ai/code"
 
 [[agents]]
-id = "codex"
-label = "Codex"
+id            = "codex"
+label         = "Codex"
 process_names = ["codex"]
-# Optional; if non-empty, at least one substring must appear in the full argv (case-insensitive).
-argv_substrings = []
-large_image = "codex"
-priority = 20
+priority      = 20
+large_image   = "codex"
+small_image   = "devsignal"
+small_text    = "devsignal"
+
+  [[agents.buttons]]
+  label = "Codex on GitHub"
+  url   = "https://github.com/openai/codex"
 
 [[agents]]
-id = "opencode"
-label = "OpenCode"
+id            = "opencode"
+label         = "OpenCode"
 process_names = ["opencode"]
-# Optional; if non-empty, at least one substring must appear in the full argv (case-insensitive).
-argv_substrings = []
-large_image = "opencode"
-priority = 30
+priority      = 30
+large_image   = "opencode"
+small_image   = "devsignal"
+small_text    = "devsignal"
+
+  [[agents.buttons]]
+  label = "OpenCode Docs"
+  url   = "https://opencode.ai"
