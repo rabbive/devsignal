@@ -31,17 +31,34 @@ impl PresenceSession {
     }
 
     pub fn set_presence(&mut self, view: &PresenceView) -> Result<()> {
-        let mut act = activity::Activity::new()
-            .details(view.details.clone())
-            .state(view.state.clone());
-
-        let assets = activity::Assets::new()
+        let mut assets = activity::Assets::new()
             .large_image(view.large_image.clone())
             .large_text(view.large_text.clone());
-        act = act.assets(assets);
 
-        if let Some(start) = view.start_timestamp_unix {
-            act = act.timestamps(activity::Timestamps::new().start(start as i64));
+        if let Some(ref si) = view.small_image {
+            assets = assets.small_image(si.clone());
+        }
+        if let Some(ref st) = view.small_text {
+            assets = assets.small_text(st.clone());
+        }
+
+        let mut act = activity::Activity::new()
+            .details(view.details.clone())
+            .state(view.state.clone())
+            .assets(assets);
+
+        if let Some(ts) = view.start_timestamp_unix {
+            act = act.timestamps(activity::Timestamps::new().start(ts as i64));
+        }
+
+        let btns: Vec<activity::Button> = view
+            .buttons
+            .iter()
+            .take(2)
+            .map(|b| activity::Button::new(b.label.as_str(), b.url.as_str()))
+            .collect();
+        if !btns.is_empty() {
+            act = act.buttons(btns);
         }
 
         self.client
