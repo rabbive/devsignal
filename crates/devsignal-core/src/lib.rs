@@ -51,6 +51,12 @@ pub struct DiscordSection {
     pub large_image: String,
     #[serde(default)]
     pub large_text: String,
+    /// Fallback small image key used during idle mode (optional).
+    #[serde(default)]
+    pub small_image: Option<String>,
+    /// Fallback small image tooltip used during idle mode (optional).
+    #[serde(default)]
+    pub small_text: Option<String>,
 }
 
 fn default_large_image() -> String {
@@ -76,6 +82,24 @@ pub struct AgentRule {
     /// Lower number = higher priority when multiple agents match.
     #[serde(default = "default_priority")]
     pub priority: i32,
+    /// Discord asset key for the small (corner) image for this agent.
+    #[serde(default)]
+    pub small_image: Option<String>,
+    /// Tooltip shown on hover over the small image.
+    #[serde(default)]
+    pub small_text: Option<String>,
+    /// Up to 2 clickable buttons shown in the Discord presence panel.
+    #[serde(default)]
+    pub buttons: Vec<ButtonConfig>,
+}
+
+/// A Discord Rich Presence button (label + URL). Maximum 2 per presence payload.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ButtonConfig {
+    /// Displayed on the button in Discord (1–32 characters).
+    pub label: String,
+    /// URL opened when the button is clicked (1–512 characters).
+    pub url: String,
 }
 
 fn default_priority() -> i32 {
@@ -114,6 +138,9 @@ pub struct ActiveAgent {
     pub id: String,
     pub label: String,
     pub large_image: String,
+    pub small_image: Option<String>,
+    pub small_text: Option<String>,
+    pub buttons: Vec<ButtonConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -122,6 +149,9 @@ pub struct PresenceView {
     pub state: String,
     pub large_image: String,
     pub large_text: String,
+    pub small_image: Option<String>,
+    pub small_text: Option<String>,
+    pub buttons: Vec<ButtonConfig>,
     pub start_timestamp_unix: Option<u64>,
 }
 
@@ -281,6 +311,9 @@ pub fn select_active_agent(mut matches: Vec<(AgentRule, u32)>) -> Option<(Active
         id: rule.id.clone(),
         label,
         large_image: large,
+        small_image: rule.small_image.clone(),
+        small_text: rule.small_text.clone(),
+        buttons: rule.buttons.clone(),
     };
     Some((agent, pid))
 }
@@ -307,6 +340,9 @@ pub fn build_presence_view(
             state: format!("In {host}{cwd_suffix}"),
             large_image: a.large_image.clone(),
             large_text: cfg.discord.large_text.clone(),
+            small_image: a.small_image.clone(),
+            small_text: a.small_text.clone(),
+            buttons: a.buttons.clone(),
             start_timestamp_unix: session_start_unix,
         },
         None => PresenceView {
@@ -314,6 +350,9 @@ pub fn build_presence_view(
             state: format!("{host} · no agent CLI detected"),
             large_image: cfg.discord.large_image.clone(),
             large_text: cfg.discord.large_text.clone(),
+            small_image: cfg.discord.small_image.clone(),
+            small_text: cfg.discord.small_text.clone(),
+            buttons: vec![],
             start_timestamp_unix: None,
         },
     }
@@ -335,6 +374,8 @@ mod tests {
                 client_id: "123".to_string(),
                 large_image: "devsignal".to_string(),
                 large_text: "devsignal".to_string(),
+                small_image: None,
+                small_text: None,
             },
             agents: vec![],
         }
@@ -348,6 +389,9 @@ mod tests {
             argv_substrings: vec![],
             large_image: None,
             priority,
+            small_image: None,
+            small_text: None,
+            buttons: vec![],
         }
     }
 
@@ -365,6 +409,9 @@ mod tests {
             state: "B".into(),
             large_image: "x".into(),
             large_text: "".into(),
+            small_image: None,
+            small_text: None,
+            buttons: vec![],
             start_timestamp_unix: None,
         };
         assert!(d.should_push(&v, true));
@@ -379,6 +426,9 @@ mod tests {
             state: "s".into(),
             large_image: "x".into(),
             large_text: "".into(),
+            small_image: None,
+            small_text: None,
+            buttons: vec![],
             start_timestamp_unix: None,
         };
         let b = PresenceView {
@@ -386,6 +436,9 @@ mod tests {
             state: "s".into(),
             large_image: "x".into(),
             large_text: "".into(),
+            small_image: None,
+            small_text: None,
+            buttons: vec![],
             start_timestamp_unix: None,
         };
         assert!(d.should_push(&a, true));
@@ -402,6 +455,9 @@ mod tests {
             state: "s".into(),
             large_image: "x".into(),
             large_text: "".into(),
+            small_image: None,
+            small_text: None,
+            buttons: vec![],
             start_timestamp_unix: None,
         };
         assert!(d.should_push(&v, true));
@@ -431,6 +487,9 @@ mod tests {
             id: "x".into(),
             label: "My Agent".into(),
             large_image: "img".into(),
+            small_image: None,
+            small_text: None,
+            buttons: vec![],
         };
         let v = build_presence_view(
             &cfg,
@@ -443,12 +502,15 @@ mod tests {
         assert_eq!(v.state, "In VS Code · proj");
         assert_eq!(v.large_image, "img");
         assert_eq!(v.start_timestamp_unix, Some(99));
+        assert!(v.small_image.is_none());
+        assert!(v.buttons.is_empty());
 
         let idle = build_presence_view(&cfg, None, None, None, None);
         assert_eq!(idle.details, "Idle");
         assert_eq!(idle.state, "macOS · no agent CLI detected");
         assert_eq!(idle.large_image, cfg.discord.large_image);
         assert!(idle.start_timestamp_unix.is_none());
+        assert!(idle.buttons.is_empty());
     }
 
     #[test]
@@ -484,6 +546,9 @@ mod tests {
             argv_substrings: vec!["CODEX".into()],
             large_image: None,
             priority: 0,
+            small_image: None,
+            small_text: None,
+            buttons: vec![],
         };
         assert!(process_matches_rule(
             "NODE",
@@ -502,6 +567,9 @@ mod tests {
             argv_substrings: vec![],
             large_image: None,
             priority: 0,
+            small_image: None,
+            small_text: None,
+            buttons: vec![],
         };
         let empty: &[&OsStr] = &[];
         assert!(process_matches_rule("foo", empty, &r));
@@ -516,6 +584,9 @@ mod tests {
             argv_substrings: vec![],
             large_image: None,
             priority: 0,
+            small_image: None,
+            small_text: None,
+            buttons: vec![],
         };
         assert!(process_matches_rule(
             "node",
@@ -543,19 +614,94 @@ mod tests {
     }
 
     #[test]
-    fn discord_section_deserializes_large_image_and_large_text() {
+    fn agent_rule_deserializes_small_image_and_buttons() {
         let toml_str = r#"
             [discord]
             client_id = "123"
-            large_image = "idle_icon"
-            large_text = "Idle"
+
+            [[agents]]
+            id = "test_agent"
+            process_names = ["test"]
+            small_image = "test_icon"
+            small_text = "Test v1"
+
+            [[agents.buttons]]
+            label = "Docs"
+            url = "https://example.com"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse failed");
+        let rule = &cfg.agents[0];
+        assert_eq!(rule.small_image.as_deref(), Some("test_icon"));
+        assert_eq!(rule.small_text.as_deref(), Some("Test v1"));
+        assert_eq!(rule.buttons.len(), 1);
+        assert_eq!(rule.buttons[0].label, "Docs");
+        assert_eq!(rule.buttons[0].url, "https://example.com");
+    }
+
+    #[test]
+    fn discord_section_deserializes_small_image_defaults() {
+        let toml_str = r#"
+            [discord]
+            client_id = "123"
+            small_image = "idle_icon"
+            small_text = "Idle"
 
             [[agents]]
             id = "a"
             process_names = ["a"]
         "#;
         let cfg: Config = toml::from_str(toml_str).expect("parse failed");
-        assert_eq!(cfg.discord.large_image, "idle_icon");
-        assert_eq!(cfg.discord.large_text, "Idle");
+        assert_eq!(cfg.discord.small_image.as_deref(), Some("idle_icon"));
+        assert_eq!(cfg.discord.small_text.as_deref(), Some("Idle"));
+    }
+
+    #[test]
+    fn build_presence_view_propagates_small_image_and_buttons() {
+        let cfg = sample_config();
+        let agent = ActiveAgent {
+            id: "claude".into(),
+            label: "Claude Code".into(),
+            large_image: "claude".into(),
+            small_image: Some("devsignal".into()),
+            small_text: Some("devsignal v0.2".into()),
+            buttons: vec![ButtonConfig {
+                label: "Docs".into(),
+                url: "https://claude.ai/code".into(),
+            }],
+        };
+        let v = build_presence_view(&cfg, Some(&agent), None, None, None);
+        assert_eq!(v.small_image.as_deref(), Some("devsignal"));
+        assert_eq!(v.small_text.as_deref(), Some("devsignal v0.2"));
+        assert_eq!(v.buttons.len(), 1);
+        assert_eq!(v.buttons[0].label, "Docs");
+        assert_eq!(v.buttons[0].url, "https://claude.ai/code");
+    }
+
+    #[test]
+    fn build_presence_view_idle_uses_discord_section_small_image() {
+        let mut cfg = sample_config();
+        cfg.discord.small_image = Some("idle_icon".into());
+        cfg.discord.small_text = Some("No agent".into());
+        let v = build_presence_view(&cfg, None, None, None, None);
+        assert_eq!(v.small_image.as_deref(), Some("idle_icon"));
+        assert_eq!(v.small_text.as_deref(), Some("No agent"));
+        assert!(v.buttons.is_empty());
+    }
+
+    #[test]
+    fn build_presence_view_no_small_image_returns_none() {
+        let cfg = sample_config();
+        let agent = ActiveAgent {
+            id: "x".into(),
+            label: "X".into(),
+            large_image: "x".into(),
+            small_image: None,
+            small_text: None,
+            buttons: vec![],
+        };
+        let v = build_presence_view(&cfg, Some(&agent), None, None, None);
+        assert!(v.small_image.is_none());
+        assert!(v.small_text.is_none());
+        assert!(v.buttons.is_empty());
     }
 }
