@@ -523,4 +523,39 @@ mod tests {
             &r
         ));
     }
+
+    #[test]
+    fn agent_rule_deserializes_large_image_and_priority() {
+        let toml_str = r#"
+            [discord]
+            client_id = "123"
+
+            [[agents]]
+            id = "test_agent"
+            process_names = ["test"]
+            large_image = "test_icon"
+            priority = 7
+        "#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse failed");
+        let rule = &cfg.agents[0];
+        assert_eq!(rule.large_image.as_deref(), Some("test_icon"));
+        assert_eq!(rule.priority, 7);
+    }
+
+    #[test]
+    fn discord_section_deserializes_large_image_and_large_text() {
+        let toml_str = r#"
+            [discord]
+            client_id = "123"
+            large_image = "idle_icon"
+            large_text = "Idle"
+
+            [[agents]]
+            id = "a"
+            process_names = ["a"]
+        "#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse failed");
+        assert_eq!(cfg.discord.large_image, "idle_icon");
+        assert_eq!(cfg.discord.large_text, "Idle");
+    }
 }
