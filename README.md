@@ -50,6 +50,9 @@ If you prefer not to use the wizard:
 | `devsignal init [--config path]` | Interactive onboarding wizard: writes config, validates, optional local install + LaunchAgent |
 | `devsignal validate --config ~/.config/devsignal/config.toml` | Load and validate config; print agent rules |
 | `devsignal once --config …` | One sample: print JSON `PresenceView` (no Discord IPC) for debugging matchers |
+| `devsignal hosts list/enable/disable` | View or change host app visibility by bundle id |
+| `devsignal agents list/enable/disable` | View or change detected AI agent CLIs by agent id |
+| `devsignal rules list/add/remove` | Manage first-match presence rules for custom state / hidden host |
 
 ### Releases (prebuilt macOS universal binary)
 
@@ -90,6 +93,17 @@ Host detection prefers **AppKit** (`NSWorkspace` / `NSRunningApplication`). If t
 - `show_cwd_basename`: when `true`, appends the **basename only** of the winning agent process working directory (never full paths). Off by default for privacy.
 - `[[agents]]`: `process_names` match **case-insensitively** against the `sysinfo` process name **or** the **basename of argv0** (so wrapped CLIs like `node …/codex` can match `codex`). Optional `argv_substrings` narrow matches when non-empty (**case-insensitive** substring match on the full command line).
 - `priority`: **lower number wins** when multiple agents match.
+- `[platforms]`: `disabled_hosts` hides selected host app bundle ids; `disabled_agents` ignores selected agent ids. All known hosts/agents are enabled by default.
+- `[[rules]]`: first-match presence rules. Conditions can match host bundle ids, agent ids, active/idle state, project basename, and local time windows. Actions can hide the host and/or override the state line.
+
+Example rule:
+
+```toml
+[[rules]]
+name = "terminal_deep_work"
+when = { host_bundle_ids = ["com.apple.Terminal"], agent_ids = ["claude_code"], active_only = true }
+then = { hide_host = true, state = "Deep work" }
+```
 
 ## Architecture
 

@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
+use chrono::Timelike;
 use devsignal_core::{
-    build_presence_view, process_matches_rule, redact_cwd_basename, select_active_agent, Config,
-    Debouncer, IdleMode,
+    agent_allowed, apply_rules, build_presence_view, host_allowed, process_matches_rule,
+    redact_cwd_basename, select_active_agent, Config, Debouncer, IdleMode, PresenceView,
+    RuleContext,
 };
 use devsignal_discord::{clear_presence_resilient, set_presence_resilient, PresenceSession};
 use std::path::{Path, PathBuf};
@@ -10,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
 use tracing::{info, warn};
 
+mod config_edit;
 mod init;
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
@@ -21,12 +24,29 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+fn local_minutes_now() -> u16 {
+    let now = chrono::Local::now();
+    (now.hour() as u16) * 60 + now.minute() as u16
+}
+
+fn hidden_host_state(active: bool, cwd_basename: Option<&str>) -> String {
+    if active {
+        cwd_basename
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("Working · {s}"))
+            .unwrap_or_else(|| "Working".to_string())
+    } else {
+        "No agent CLI detected".to_string()
+    }
+}
+
 #[derive(Debug)]
 enum Cli {
     Run(RunArgs),
     Validate { config: PathBuf },
     Once { config: PathBuf },
     Init { config: PathBuf },
+    ConfigEdit(config_edit::ConfigEditCommand),
 }
 
 #[derive(Debug)]
@@ -45,6 +65,9 @@ fn print_global_help() {
            devsignal init [--config path]\n\
            devsignal validate [--config path]\n\
            devsignal once [--config path]\n\
+           devsignal hosts list|enable|disable ...\n\
+           devsignal agents list|enable|disable ...\n\
+           devsignal rules list|add|remove ...\n\
          \n\
          Default config: {}\n\
          \n\
@@ -131,6 +154,18 @@ fn parse_cli() -> Result<Cli> {
             let rest = &args[1..];
             Ok(Cli::Run(parse_run_args(rest)?))
         }
+        "hosts" => {
+            let rest = &args[1..];
+            Ok(Cli::ConfigEdit(config_edit::parse_hosts_command(rest)?))
+        }
+        "agents" => {
+            let rest = &args[1..];
+            Ok(Cli::ConfigEdit(config_edit::parse_agents_command(rest)?))
+        }
+        "rules" => {
+            let rest = &args[1..];
+            Ok(Cli::ConfigEdit(config_edit::parse_rules_command(rest)?))
+        }
         "help" | "--help" | "-h" => {
             print_global_help();
             std::process::exit(0);
@@ -146,12 +181,42 @@ fn collect_matches(sys: &System, cfg: &Config) -> Vec<(devsignal_core::AgentRule
         let name = proc.name().to_string_lossy();
         let cmd = proc.cmd();
         for rule in &cfg.agents {
-            if process_matches_rule(&name, cmd, rule) {
+            if agent_allowed(cfg, Some(&rule.id)) && process_matches_rule(&name, cmd, rule) {
                 out.push((rule.clone(), pid.as_u32()));
             }
         }
     }
     out
+}
+
+fn build_policy_view(
+    cfg: &Config,
+    agent: Option<&devsignal_core::ActiveAgent>,
+    host_bundle_id: Option<&str>,
+    session_start_unix: Option<u64>,
+    cwd_basename: Option<&str>,
+    local_minutes: Option<u16>,
+) -> PresenceView {
+    let host_is_allowed = host_allowed(cfg, host_bundle_id);
+    let ctx = RuleContext {
+        host_bundle_id,
+        agent_id: agent.map(|a| a.id.as_str()),
+        cwd_basename,
+        active: agent.is_some(),
+        local_minutes,
+    };
+    let policy = apply_rules(cfg, &ctx);
+    let hide_host = !host_is_allowed || policy.hide_host;
+    let visible_host = if hide_host { None } else { host_bundle_id };
+
+    let mut view = build_presence_view(cfg, agent, visible_host, session_start_unix, cwd_basename);
+    if hide_host && policy.state.is_none() {
+        view.state = hidden_host_state(agent.is_some(), cwd_basename);
+    }
+    if let Some(state) = policy.state {
+        view.state = state;
+    }
+    view
 }
 
 fn connect_with_wait(session: &mut PresenceSession, wait: bool) -> Result<()> {
@@ -198,12 +263,13 @@ fn cmd_once(config_path: &Path) -> Result<()> {
     let matches = collect_matches(&sys, &cfg);
     let selected = select_active_agent(matches);
     let bundle = devsignal_macos::frontmost_bundle_id();
-    let view = build_presence_view(
+    let view = build_policy_view(
         &cfg,
         selected.as_ref().map(|(a, _)| a),
         bundle.as_deref(),
         None,
         None,
+        Some(local_minutes_now()),
     );
     println!(
         "{}",
@@ -259,6 +325,13 @@ fn main() {
                 }
             },
             Cli::Run(args) => match run_daemon(args) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("{e:#}");
+                    1
+                }
+            },
+            Cli::ConfigEdit(cmd) => match config_edit::run_config_edit(cmd) {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("{e:#}");
@@ -369,12 +442,13 @@ fn run_forever(mut state: RunState) {
 
         let bundle = devsignal_macos::frontmost_bundle_id();
 
-        let view = build_presence_view(
+        let view = build_policy_view(
             &state.cfg,
             selected.as_ref().map(|(a, _)| a),
             bundle.as_deref(),
             state.session_start_unix,
             cwd_hint.as_deref(),
+            Some(local_minutes_now()),
         );
 
         let force = transition || state.first_tick;

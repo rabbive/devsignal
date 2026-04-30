@@ -6,6 +6,11 @@ min_push_interval_secs = 20   # Minimum time between Discord IPC pushes (reduces
 idle_mode              = "status"  # "status" = show Idle line; "clear" = hide presence entirely.
 show_cwd_basename      = false     # Show the basename of the agent's working directory. Off by default for privacy.
 
+[platforms]
+# All known host apps and agents are enabled by default. Add ids here to hide/ignore them.
+disabled_hosts  = [] # e.g. ["com.todesktop.230313mzl4w4u92"] to hide Cursor as a host label.
+disabled_agents = [] # e.g. ["opencode"] to ignore that agent rule.
+
 [discord]
 # Your Discord Application ID from https://discord.com/developers/applications
 client_id   = "YOUR_DISCORD_APPLICATION_ID"
@@ -59,3 +64,9 @@ small_text    = "devsignal"
   [[agents.buttons]]
   label = "OpenCode Docs"
   url   = "https://opencode.ai"
+
+# Optional first-match rules for creative/privacy-aware presence text.
+# [[rules]]
+# name = "terminal_deep_work"
+# when = { host_bundle_ids = ["com.apple.Terminal"], agent_ids = ["claude_code"], active_only = true }
+# then = { hide_host = true, state = "Deep work" }

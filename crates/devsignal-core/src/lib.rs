@@ -22,6 +22,10 @@ pub struct Config {
     pub discord: DiscordSection,
     #[serde(default)]
     pub agents: Vec<AgentRule>,
+    #[serde(default)]
+    pub platforms: PlatformsConfig,
+    #[serde(default)]
+    pub rules: Vec<PresenceRule>,
 }
 
 /// What to do when no configured agent process is running.
@@ -100,6 +104,69 @@ pub struct ButtonConfig {
     pub label: String,
     /// URL opened when the button is clicked (1–512 characters).
     pub url: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct PlatformsConfig {
+    #[serde(default)]
+    pub disabled_hosts: Vec<String>,
+    #[serde(default)]
+    pub disabled_agents: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct PresenceRule {
+    pub name: String,
+    #[serde(default)]
+    pub when: RuleWhen,
+    #[serde(default)]
+    pub then: RuleThen,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RuleWhen {
+    #[serde(default)]
+    pub host_bundle_ids: Vec<String>,
+    #[serde(default)]
+    pub agent_ids: Vec<String>,
+    #[serde(default)]
+    pub active_only: bool,
+    #[serde(default)]
+    pub idle_only: bool,
+    #[serde(default)]
+    pub project_basenames: Vec<String>,
+    #[serde(default)]
+    pub time: Option<TimeWindow>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RuleThen {
+    #[serde(default)]
+    pub hide_host: bool,
+    #[serde(default)]
+    pub state: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TimeWindow {
+    pub start: String,
+    pub end: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RuleContext<'a> {
+    pub host_bundle_id: Option<&'a str>,
+    pub agent_id: Option<&'a str>,
+    pub cwd_basename: Option<&'a str>,
+    pub active: bool,
+    pub local_minutes: Option<u16>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PresencePolicyOverride {
+    pub matched_rule_name: Option<String>,
+    pub hide_host: bool,
+    pub state: Option<String>,
 }
 
 fn default_priority() -> i32 {
@@ -251,6 +318,99 @@ pub fn host_label_for_bundle(bundle_id: &str) -> String {
     bundle_id.to_string()
 }
 
+fn contains_ignore_ascii_case(items: &[String], needle: &str) -> bool {
+    items.iter().any(|item| item.eq_ignore_ascii_case(needle))
+}
+
+pub fn host_allowed(cfg: &Config, bundle_id: Option<&str>) -> bool {
+    bundle_id.is_none_or(|id| !contains_ignore_ascii_case(&cfg.platforms.disabled_hosts, id))
+}
+
+pub fn agent_allowed(cfg: &Config, agent_id: Option<&str>) -> bool {
+    agent_id.is_none_or(|id| !contains_ignore_ascii_case(&cfg.platforms.disabled_agents, id))
+}
+
+fn parse_hhmm_minutes(s: &str) -> Option<u16> {
+    let (hh, mm) = s.split_once(':')?;
+    let hour: u16 = hh.parse().ok()?;
+    let minute: u16 = mm.parse().ok()?;
+    if hour < 24 && minute < 60 {
+        Some(hour * 60 + minute)
+    } else {
+        None
+    }
+}
+
+impl TimeWindow {
+    pub fn matches_minutes(&self, minutes: u16) -> bool {
+        let Some(start) = parse_hhmm_minutes(&self.start) else {
+            return false;
+        };
+        let Some(end) = parse_hhmm_minutes(&self.end) else {
+            return false;
+        };
+        if start <= end {
+            minutes >= start && minutes <= end
+        } else {
+            minutes >= start || minutes <= end
+        }
+    }
+}
+
+impl RuleWhen {
+    fn matches(&self, ctx: &RuleContext<'_>) -> bool {
+        if self.active_only && !ctx.active {
+            return false;
+        }
+        if self.idle_only && ctx.active {
+            return false;
+        }
+        if !self.host_bundle_ids.is_empty()
+            && !ctx
+                .host_bundle_id
+                .is_some_and(|id| contains_ignore_ascii_case(&self.host_bundle_ids, id))
+        {
+            return false;
+        }
+        if !self.agent_ids.is_empty()
+            && !ctx
+                .agent_id
+                .is_some_and(|id| contains_ignore_ascii_case(&self.agent_ids, id))
+        {
+            return false;
+        }
+        if !self.project_basenames.is_empty()
+            && !ctx
+                .cwd_basename
+                .is_some_and(|name| contains_ignore_ascii_case(&self.project_basenames, name))
+        {
+            return false;
+        }
+        if let Some(window) = &self.time {
+            let Some(minutes) = ctx.local_minutes else {
+                return false;
+            };
+            if !window.matches_minutes(minutes) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+pub fn apply_rules(cfg: &Config, ctx: &RuleContext<'_>) -> PresencePolicyOverride {
+    for rule in &cfg.rules {
+        if rule.when.matches(ctx) {
+            return PresencePolicyOverride {
+                matched_rule_name: Some(rule.name.clone()),
+                hide_host: rule.then.hide_host,
+                state: rule.then.state.clone(),
+            };
+        }
+    }
+    PresencePolicyOverride::default()
+}
+
 /// Match a process against an agent rule: `process_names` vs process `name` (case-insensitive)
 /// or vs the **basename** of `cmd[0]` (for wrapped CLIs, e.g. `node …/codex.js`), then optional
 /// `argv_substrings` against the full command line (case-insensitive).
@@ -387,7 +547,85 @@ mod tests {
                 small_text: None,
             },
             agents: vec![],
+            platforms: PlatformsConfig::default(),
+            rules: vec![],
         }
+    }
+
+    #[test]
+    fn platform_config_disables_hosts_and_agents_by_id() {
+        let mut cfg = sample_config();
+        cfg.platforms.disabled_hosts = vec!["com.apple.Terminal".into()];
+        cfg.platforms.disabled_agents = vec!["opencode".into()];
+
+        assert!(!host_allowed(&cfg, Some("com.apple.Terminal")));
+        assert!(host_allowed(&cfg, Some("com.microsoft.VSCode")));
+        assert!(host_allowed(&cfg, None));
+        assert!(!agent_allowed(&cfg, Some("opencode")));
+        assert!(agent_allowed(&cfg, Some("claude_code")));
+        assert!(agent_allowed(&cfg, None));
+    }
+
+    #[test]
+    fn rule_time_window_matches_same_day_and_overnight() {
+        let day = TimeWindow {
+            start: "09:00".into(),
+            end: "17:00".into(),
+        };
+        assert!(day.matches_minutes(9 * 60));
+        assert!(day.matches_minutes(12 * 60));
+        assert!(!day.matches_minutes(18 * 60));
+
+        let overnight = TimeWindow {
+            start: "22:00".into(),
+            end: "06:00".into(),
+        };
+        assert!(overnight.matches_minutes(23 * 60));
+        assert!(overnight.matches_minutes(2 * 60));
+        assert!(!overnight.matches_minutes(12 * 60));
+    }
+
+    #[test]
+    fn apply_rules_returns_first_matching_override() {
+        let mut cfg = sample_config();
+        cfg.rules = vec![
+            PresenceRule {
+                name: "terminal_focus".into(),
+                when: RuleWhen {
+                    host_bundle_ids: vec!["com.apple.Terminal".into()],
+                    agent_ids: vec!["claude_code".into()],
+                    active_only: true,
+                    idle_only: false,
+                    project_basenames: vec![],
+                    time: None,
+                },
+                then: RuleThen {
+                    hide_host: true,
+                    state: Some("Deep work".into()),
+                },
+            },
+            PresenceRule {
+                name: "later_rule_ignored".into(),
+                when: RuleWhen::default(),
+                then: RuleThen {
+                    hide_host: false,
+                    state: Some("Should not win".into()),
+                },
+            },
+        ];
+
+        let ctx = RuleContext {
+            host_bundle_id: Some("com.apple.Terminal"),
+            agent_id: Some("claude_code"),
+            cwd_basename: Some("devsignal"),
+            active: true,
+            local_minutes: Some(12 * 60),
+        };
+
+        let out = apply_rules(&cfg, &ctx);
+        assert_eq!(out.matched_rule_name.as_deref(), Some("terminal_focus"));
+        assert!(out.hide_host);
+        assert_eq!(out.state.as_deref(), Some("Deep work"));
     }
 
     #[test]

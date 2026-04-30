@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use console::style;
-use devsignal_core::{AgentRule, ButtonConfig, Config, DiscordSection, IdleMode};
+use devsignal_core::{
+    AgentRule, ButtonConfig, Config, DiscordSection, IdleMode, PlatformsConfig, PresenceRule,
+    RuleThen, RuleWhen, TimeWindow, HOST_BUNDLE_LABELS,
+};
 use dialoguer::{Confirm, Input, MultiSelect, Select};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -84,6 +87,8 @@ fn generate_config(
     discord_client_id: String,
     show_cwd_basename: bool,
     agents: Vec<AgentRule>,
+    disabled_hosts: Vec<String>,
+    rules: Vec<PresenceRule>,
 ) -> Config {
     Config {
         poll_interval_secs: 2,
@@ -98,6 +103,11 @@ fn generate_config(
             small_text: None,
         },
         agents,
+        platforms: PlatformsConfig {
+            disabled_hosts,
+            disabled_agents: vec![],
+        },
+        rules,
     }
 }
 
@@ -156,6 +166,102 @@ fn choose_agents() -> Result<Vec<AgentRule>> {
         }
     }
     Ok(out)
+}
+
+fn choose_disabled_hosts() -> Result<Vec<String>> {
+    let labels = HOST_BUNDLE_LABELS
+        .iter()
+        .map(|(bundle, label)| format!("{label} ({bundle})"))
+        .collect::<Vec<_>>();
+    let defaults = vec![true; labels.len()];
+    let selections = MultiSelect::new()
+        .with_prompt("Select host platforms DevSignal may show (all enabled by default)")
+        .items(&labels)
+        .defaults(&defaults)
+        .interact()
+        .context("read host selection")?;
+    let enabled = selections
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    Ok(HOST_BUNDLE_LABELS
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| !enabled.contains(idx))
+        .map(|(_, (bundle, _))| (*bundle).to_string())
+        .collect())
+}
+
+fn choose_rule_presets() -> Result<Vec<PresenceRule>> {
+    let items = vec![
+        "Focus mode in Terminal (Claude Code -> Deep work, hide host)",
+        "After-hours privacy (22:00-06:00 -> Heads down, hide host)",
+        "Hide host for secret projects (basename: secret -> Private build)",
+    ];
+    let selected = MultiSelect::new()
+        .with_prompt("Optional creative presence rules")
+        .items(&items)
+        .defaults(&[false, false, false])
+        .interact()
+        .context("read rule presets")?;
+
+    let mut rules = Vec::new();
+    for idx in selected {
+        match idx {
+            0 => rules.push(PresenceRule {
+                name: "terminal_deep_work".into(),
+                when: RuleWhen {
+                    host_bundle_ids: vec![
+                        "com.apple.Terminal".into(),
+                        "com.googlecode.iterm2".into(),
+                    ],
+                    agent_ids: vec!["claude_code".into()],
+                    active_only: true,
+                    idle_only: false,
+                    project_basenames: vec![],
+                    time: None,
+                },
+                then: RuleThen {
+                    hide_host: true,
+                    state: Some("Deep work".into()),
+                },
+            }),
+            1 => rules.push(PresenceRule {
+                name: "after_hours_privacy".into(),
+                when: RuleWhen {
+                    host_bundle_ids: vec![],
+                    agent_ids: vec![],
+                    active_only: true,
+                    idle_only: false,
+                    project_basenames: vec![],
+                    time: Some(TimeWindow {
+                        start: "22:00".into(),
+                        end: "06:00".into(),
+                    }),
+                },
+                then: RuleThen {
+                    hide_host: true,
+                    state: Some("Heads down".into()),
+                },
+            }),
+            2 => rules.push(PresenceRule {
+                name: "secret_project_privacy".into(),
+                when: RuleWhen {
+                    host_bundle_ids: vec![],
+                    agent_ids: vec![],
+                    active_only: true,
+                    idle_only: false,
+                    project_basenames: vec!["secret".into()],
+                    time: None,
+                },
+                then: RuleThen {
+                    hide_host: true,
+                    state: Some("Private build".into()),
+                },
+            }),
+            _ => {}
+        }
+    }
+    Ok(rules)
 }
 
 fn default_config_path_hint(path: &Path) -> String {
@@ -382,6 +488,8 @@ pub fn cmd_init(config_path: &Path) -> Result<()> {
         !agents.is_empty(),
         "at least one agent must be selected (Config requires [[agents]])"
     );
+    let disabled_hosts = choose_disabled_hosts()?;
+    let rules = choose_rule_presets()?;
 
     println!();
     println!("{}", style("Art assets (optional for now):").bold());
@@ -405,7 +513,13 @@ pub fn cmd_init(config_path: &Path) -> Result<()> {
         false
     };
 
-    let cfg = generate_config(discord_client_id, show_cwd_basename, agents);
+    let cfg = generate_config(
+        discord_client_id,
+        show_cwd_basename,
+        agents,
+        disabled_hosts,
+        rules,
+    );
     write_config_file(config_path, &cfg, overwrite)?;
 
     // Validate by re-loading from disk (uses core validation).
@@ -435,7 +549,7 @@ mod tests {
 
     #[test]
     fn generate_config_sets_cwd_flag() {
-        let cfg = generate_config("1".into(), true, default_agents());
+        let cfg = generate_config("1".into(), true, default_agents(), vec![], vec![]);
         assert!(cfg.show_cwd_basename);
         assert_eq!(cfg.discord.client_id, "1");
         assert!(!cfg.agents.is_empty());
