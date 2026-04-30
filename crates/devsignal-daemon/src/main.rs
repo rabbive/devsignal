@@ -10,6 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
 use tracing::{info, warn};
 
+mod init;
+
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
 fn now_unix() -> u64 {
@@ -24,6 +26,7 @@ enum Cli {
     Run(RunArgs),
     Validate { config: PathBuf },
     Once { config: PathBuf },
+    Init { config: PathBuf },
 }
 
 #[derive(Debug)]
@@ -39,6 +42,7 @@ fn print_global_help() {
          \n\
          Usage:\n\
            devsignal [run] [options]\n\
+           devsignal init [--config path]\n\
            devsignal validate [--config path]\n\
            devsignal once [--config path]\n\
          \n\
@@ -105,6 +109,12 @@ fn parse_cli() -> Result<Cli> {
         }));
     }
     match args[0].as_str() {
+        "init" => {
+            let rest = &args[1..];
+            Ok(Cli::Init {
+                config: parse_config_path_only(rest)?,
+            })
+        }
         "validate" => {
             let rest = &args[1..];
             Ok(Cli::Validate {
@@ -227,6 +237,13 @@ fn main() {
         };
 
         let code = match cli {
+            Cli::Init { config } => match init::cmd_init(&config) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("{e:#}");
+                    1
+                }
+            },
             Cli::Validate { config } => match cmd_validate(&config) {
                 Ok(()) => 0,
                 Err(e) => {

@@ -116,6 +116,15 @@ impl Config {
     }
 
     pub fn default_path() -> std::path::PathBuf {
+        // Prefer the conventional dot-config path to match repo docs/scripts:
+        // `~/.config/devsignal/config.toml`.
+        if let Ok(home) = std::env::var("HOME") {
+            let p = std::path::PathBuf::from(home)
+                .join(".config")
+                .join("devsignal")
+                .join("config.toml");
+            return p;
+        }
         let base = dirs::config_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
         base.join("devsignal").join("config.toml")
     }
@@ -379,6 +388,14 @@ mod tests {
             },
             agents: vec![],
         }
+    }
+
+    #[test]
+    fn default_path_prefers_home_dot_config() {
+        // This test asserts path shape rather than exact HOME contents.
+        let p = Config::default_path();
+        let s = p.to_string_lossy();
+        assert!(s.contains("/.config/devsignal/config.toml"));
     }
 
     fn rule(id: &str, priority: i32) -> AgentRule {

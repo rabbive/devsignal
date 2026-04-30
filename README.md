@@ -12,9 +12,13 @@ Unified **Discord Rich Presence** for AI coding CLIs on **macOS**. One daemon, o
 
 ## Quick start
 
-1. Scaffold config (from repo root): `./scripts/setup-local-config.sh` — or copy `config.example.toml` to `~/.config/devsignal/config.toml` yourself.
-2. Set `discord.client_id` to your Application ID.
-3. Run a **release binary** (see below) or from source:
+1. Run the interactive wizard:
+
+```bash
+cargo run -p devsignal-daemon -- init
+```
+
+2. Run the daemon:
 
 ```bash
 cargo run --release -p devsignal-daemon -- run
@@ -22,11 +26,28 @@ cargo run --release -p devsignal-daemon -- run
 
 Leave **Discord desktop** open; the daemon talks to it over local IPC. If Discord is not running yet, the daemon **retries IPC for up to 30 seconds** by default (`--wait-for-discord`; use `--no-wait-for-discord` to fail fast).
 
+### Privacy presets
+
+`devsignal init` offers presets:
+
+- **Minimal**: agent + frontmost host app only.
+- **Project-safe**: also shows the **project basename** (never full paths).
+- **Public/OSS**: polished defaults; no project names by default.
+- **Custom**: choose per-option.
+
+### Manual setup (fallback)
+
+If you prefer not to use the wizard:
+
+1. Scaffold config (from repo root): `./scripts/setup-local-config.sh` — or copy `config.example.toml` to `~/.config/devsignal/config.toml` yourself.
+2. Set `discord.client_id` to your Application ID.
+
 ### CLI
 
 | Command | Purpose |
 | --- | --- |
 | `devsignal` / `devsignal run` | Long-running daemon (default config path unless `--config`) |
+| `devsignal init [--config path]` | Interactive onboarding wizard: writes config, validates, optional local install + LaunchAgent |
 | `devsignal validate --config ~/.config/devsignal/config.toml` | Load and validate config; print agent rules |
 | `devsignal once --config …` | One sample: print JSON `PresenceView` (no Discord IPC) for debugging matchers |
 

@@ -2,6 +2,7 @@
 
 - Prefers the agent to run builds, checks, and git or GitHub CLI steps locally when possible instead of only describing commands for the user to run.
 - When the caveman skill is attached to a message, follow its terse style until the user says "stop caveman" or "normal mode".
+- When a plan is attached and todos already exist, do not edit the plan file or recreate todos; execute the plan and update existing todo statuses as you work.
 
 ## Learned Workspace Facts
 
