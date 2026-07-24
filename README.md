@@ -1,13 +1,23 @@
 # devsignal
 
-Unified **Discord Rich Presence** for AI coding CLIs on **macOS**. One daemon, one Discord connection: it detects which agent-style tool is running (for example Claude Code, Codex, OpenCode — configurable) and shows the **frontmost host app** (Cursor, VS Code, JetBrains, terminals, etc.).
+Unified **Discord Rich Presence** for AI coding CLIs on **macOS**. One daemon, one Discord
+connection: it detects which agent-style tool is running and shows the **frontmost host app**
+(Cursor, VS Code, JetBrains, terminals, etc.).
+
+Ships presets for Claude Code, Codex, Gemini CLI, OpenCode, Amp, Cursor Agent, Copilot CLI,
+Aider, Crush, Qwen Code, Droid, Cline, and Goose — all configurable, and
+`devsignal detect` tells you what your machine actually reports.
 
 ## Discord application setup
 
 1. Open the [Discord Developer Portal](https://discord.com/developers/applications) and **New Application**.
 2. In **OAuth2** (optional for local IPC): not required for Rich Presence; you only need the app record.
 3. Copy **Application ID** (this is the Rich Presence `client_id`).
-4. Under **Rich Presence → Art Assets**, upload PNGs. Each **image key** must match what you put in `config.toml` (`large_image` per agent and the global default).
+4. Under **Rich Presence → Art Assets**, upload PNGs. Each **image key** must match what you put in
+   `config.toml` (`large_image` per agent, plus the global `devsignal` default). A key you have not
+   uploaded renders **blank**, so upload only the agents you use and delete the `large_image` line
+   for the rest — they then fall back to the `devsignal` image. `devsignal init` prints the exact
+   list of keys for your selection.
 5. Install and run the **Discord desktop** client (not only the web app). The daemon connects over local IPC.
 
 ## Quick start
