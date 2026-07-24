@@ -32,6 +32,14 @@ cargo test -p devsignal-core <test_name>
 cargo run -p devsignal-daemon -- validate --config ~/.config/devsignal/config.toml
 cargo run -p devsignal-daemon -- once     --config ~/.config/devsignal/config.toml
 cargo run -p devsignal-daemon -- detect   --config ~/.config/devsignal/config.toml
+cargo run -p devsignal-daemon -- detect --unmatched   # find an agent's process name
+cargo run -p devsignal-daemon -- watch    --config ~/.config/devsignal/config.toml
+
+# Check the MSRV claim (CI does this too; `stable` will not catch a violation)
+cargo +1.87 check -p devsignal-core -p devsignal-discord -p devsignal-daemon --all-targets
+
+# Lint shell scripts (CI installs shellcheck)
+shellcheck packaging/macos/install.sh scripts/*.sh
 
 # Guided setup wizard (writes config, optionally installs LaunchAgent)
 cargo run -p devsignal-daemon -- init
@@ -40,9 +48,10 @@ cargo run -p devsignal-daemon -- init
 ./scripts/setup-local-config.sh
 ```
 
-CI (`.github/workflows/ci.yml`): a Linux `lint` job runs `cargo fmt --check` plus clippy and tests
-for every crate except `devsignal-macos`, and a `macos` job runs workspace clippy, `cargo test`, and
-a release build, and an `msrv` job pins the declared `rust-version` so it stays a checked claim.
+CI (`.github/workflows/ci.yml`) has three jobs: `lint` (Linux) runs `cargo fmt --check`, clippy, tests,
+and `shellcheck` for every crate except `devsignal-macos`; `msrv` builds against exactly the declared
+`rust-version` so that claim stays checked; `macos` runs workspace clippy, `cargo test`, and a release
+build.
 MSRV is Rust **1.87** (`workspace.package.rust-version`) — determined empirically; the floor comes
 from the dependency graph as much as from our code. `Cargo.lock` is committed.
 
@@ -63,9 +72,11 @@ Rust workspace, 4 crates under `crates/`:
 
 `devsignal-daemon` modules:
 
-- `main.rs` — command dispatch, `run_daemon`/`run_forever` poll loop, `build_policy_view`,
-  `collect_matches`, and the `validate`/`once`/`detect` commands
+- `main.rs` — command dispatch, `run_loop`/`run_forever`, `build_policy_view`, `collect_matches`,
+  `maybe_reload_config`, and the `validate`/`once`/`detect`/`watch` commands
 - `cli.rs` — argument parsing and help/version text; no platform gating, so CI lints and tests it
+- `sink.rs` — `PresenceSink` with `DiscordSink` (real IPC) and `StdoutSink` (backs `watch`); the seam
+  that makes the poll loop, including shutdown-and-clear, testable without a Discord client
 - `config_io.rs` — `write_config_atomic`: serialize → round-trip → validate → temp file → rename
 - `init.rs` — interactive `devsignal init` wizard (`dialoguer` + `console`): Discord app ID, privacy
   preset, agent multi-select, host multi-select, optional rule presets, then optional copy to
@@ -74,9 +85,15 @@ Rust workspace, 4 crates under `crates/`:
 
 ### Main loop (every `poll_interval_secs`, `run_forever` in `main.rs`)
 
-1. `sysinfo` refreshes processes, requesting only `cmd` (plus `cwd` when `show_cwd_basename` is
-   set) via `process_refresh_kind` — name is always provided. Deliberately not `everything()`, which
-   also refreshed `environ`, `exe`, memory, CPU, and disk for every process on the machine.
+0. `maybe_reload_config` stats the config file and reloads on an mtime change. A config that no
+   longer loads is warned about and **ignored**, keeping the previous one — a bad edit must not kill a
+   running daemon. A reload forces the next push so the change is visible immediately. A changed
+   `discord.client_id` cannot be applied without reconnecting, so it warns instead.
+1. `refresh_processes` calls `refresh_processes_specifics(ProcessesToUpdate::All, true, …)`. That
+   `true` is `remove_dead_processes`; `refresh_specifics` passes `false`, which is why exited agents
+   used to linger in the snapshot and presence kept showing a CLI you had quit. It requests only
+   `cmd` (plus `cwd` when `show_cwd_basename` is set) — name is always provided. Deliberately not
+   `everything()`, which also refreshed `environ`, `exe`, memory, CPU, and disk for every process.
 2. `collect_matches` runs `process_matches_rule` for each process × each `[[agents]]` rule
    (case-insensitive process name **or** `basename(argv[0])`, plus optional `argv_substrings`
    against the joined command line). Rules disabled via `platforms.disabled_agents` are skipped
@@ -86,21 +103,33 @@ Rust workspace, 4 crates under `crates/`:
    the `ActiveAgent` plus its PID.
 4. Agent-id change (`transition`) resets `session_start_unix` to now, so the Discord elapsed timer
    restarts per agent session.
-5. If no agent matched and `idle_mode = "clear"`, the loop clears presence (only on transition or
-   first tick) and skips the rest of the tick.
+5. If no agent matched and `idle_mode = "clear"`, the loop clears presence — through the debouncer,
+   which this branch used to bypass entirely — and skips the rest of the tick.
 6. `show_cwd_basename` optionally resolves the winning PID's CWD through `redact_cwd_basename`.
-7. `devsignal_macos::frontmost_bundle_id()` gets the focused app's bundle ID.
+7. `devsignal_macos::frontmost_bundle_id()` gets the focused app's bundle ID. AppKit first; after two
+   consecutive misses it falls back to a **time-boxed** `osascript` (2s, killed on timeout) with
+   exponential backoff on repeated failure. Untimed, a wedged `System Events` blocked the whole loop —
+   and therefore shutdown and the final clear.
 8. `build_policy_view` → `apply_rules` (first matching `[[rules]]` wins) → `build_presence_view`,
    then applies the override: `hide_host` drops the host label (falling back to
    `hidden_host_state`, e.g. `Working · myrepo`), and `then.state` replaces `state` outright.
-   `platforms.disabled_hosts` forces `hide_host` too.
-9. `Debouncer::should_push` suppresses the Discord call when the payload is byte-identical or
-   `min_push_interval_secs` hasn't elapsed; `force` is set on agent transitions and the first tick.
-10. `set_presence_resilient` pushes over IPC.
+   `platforms.disabled_hosts` forces `hide_host` too. Returns the matched rule name alongside the
+   view — **not** on `PresenceView`, which is the debouncer's equality key.
+9. `Debouncer::should_send` takes a `PresenceAction` (`Set` or `Clear`) so both paths share one
+   limiter. It suppresses an unchanged payload or one inside `min_push_interval_secs`, and enforces a
+   sliding window of 5 sends per 20s — Discord's documented limit — **even when `force` is set**.
+   `force` is set on agent transitions, the first tick, and after a config reload.
+10. The `PresenceSink` sends it: Discord IPC under `run`, stdout under `watch`.
 
-On SIGINT/SIGTERM the `RUNNING` atomic flips false → loop exits → `clear_presence_resilient` runs
-before exit. `connect_with_wait` retries IPC with exponential backoff up to 30s when
-`--wait-for-discord` (the default) is set.
+On SIGINT/SIGTERM the `RUNNING` atomic flips false → loop exits → the sink clears. That final clear is
+the one deliberate bypass of the debouncer. `sleep_interruptible` sleeps in 200ms slices so shutdown
+does not wait out `poll_interval_secs` (which has no upper bound). `connect_with_wait` retries IPC with
+exponential backoff up to 30s when `--wait-for-discord` (the default) is set.
+
+Three integration tests cover this loop, all running on Linux: `tests/shutdown.rs` (SIGTERM and SIGINT
+each exit 0 *and* emit a clear), `tests/detection.rs` (an agent is released when it exits), and
+`tests/hot_reload.rs` (an invalid edit is ignored without killing the daemon). Each was verified to
+fail when its fix is reverted.
 
 ### CLI surface
 
@@ -109,10 +138,15 @@ devsignal [run] [-c path] [--wait-for-discord | --no-wait-for-discord]
 devsignal init     [-c path]     # interactive wizard
 devsignal validate [-c path]     # parse + validate, print agents/rules/platforms
 devsignal once     [-c path]     # print the PresenceView as JSON, no IPC
-devsignal detect   [-c path]     # matching processes, the winner, and why
+devsignal detect   [-c path]     # matching processes, the winner, the matched rule
+devsignal detect --unmatched     # processes no rule matched (--all skips the filter)
+devsignal watch    [-c path]     # the real poll loop, printing instead of using Discord
 devsignal version | --version | -V
 devsignal hosts  list | enable <bundle_id> | disable <bundle_id>
-devsignal agents list | enable <agent_id>  | disable <agent_id>
+devsignal agents list | enable <id> | disable <id> | remove <id> |
+                 add --id <id> --process-name <name> [--label t] [--priority n]
+                     [--large-image k] [--small-image k] [--small-text t]
+                     [--button "Label=URL"]
 devsignal rules  list | remove <name> | add --name <n> [--host id] [--agent id]
                                             [--project name] [--time HH:MM-HH:MM]
                                             [--active-only] [--idle-only]
@@ -132,8 +166,11 @@ to stdout. Platform gating is a runtime check in `require_macos`, applied only t
   OS-specific code out of it.
 - Agent matching checks both `proc.name()` and `basename(argv[0])` so wrapped Node CLIs
   (e.g. `node .../codex`) still match `codex`.
-- `Debouncer` compares the last pushed `PresenceView` by value equality — no hashing, just the
-  derived `PartialEq`. Any new `PresenceView` field automatically participates in debouncing.
+- `Debouncer` compares the last sent action by value equality — no hashing, just the derived
+  `PartialEq`. Any new `PresenceView` field automatically participates in debouncing, which is exactly
+  why `matched_rule_name` is **not** a field on it: a rule-name change alone would trigger a Discord
+  write with identical visible text. It also owns the 5-per-20s rate limit, which applies to forced
+  sends too — `force` keeps transitions responsive, it does not license unbounded IPC traffic.
 - `show_cwd_basename` redacts to the last path segment only (`redact_cwd_basename`, which also
   rejects `.` and single-component roots); full paths never reach Discord.
 - `[[rules]]` are **first-match-wins**, evaluated in file order (`apply_rules`). `RuleWhen` fields
@@ -149,7 +186,13 @@ to stdout. Platform gating is a runtime check in `require_macos`, applied only t
   subcommand rewrites a hand-edited file, and the subcommands now say so.
 - Agent presets live in `devsignal-core::agent_presets()`, consumed by the `init` wizard; a core test
   asserts `config.example.toml` and the preset table describe the same agent ids in both directions.
-  Preset process names are best-effort — `devsignal detect` is how you confirm them on a real machine.
+  **Only agents with process names confirmed on a real machine belong there** — adding one is a claim
+  that `devsignal detect` was run against it. Unconfirmed agents go in `docs/community-presets.md`,
+  whose TOML snippets are themselves validated by a core test. A preset that never matches makes the
+  daemon look broken with no way to tell why, which is the failure mode all the validation work exists
+  to prevent.
+- Platform gating is a runtime check (`require_macos`), not `cfg`, so CI can lint and test everything
+  except `devsignal-macos`. Only `run` and `init` are gated.
 - Presence assets are Discord art-asset **keys**, not URLs — they must be uploaded in the Discord
   Developer Portal (`devsignal`, `claude`, `codex`, `opencode` by default).
 
