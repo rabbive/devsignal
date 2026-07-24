@@ -3,14 +3,14 @@ use chrono::Timelike;
 use devsignal_core::{
     agent_allowed, apply_rules, build_presence_view, host_allowed, host_label_for_bundle,
     process_matches_rule, redact_cwd_basename, select_active_agent, ActiveAgent, AgentRule, Config,
-    Debouncer, IdleMode, PresenceView, RuleContext,
+    Debouncer, IdleMode, PresenceAction, PresenceView, RuleContext,
 };
 use devsignal_discord::PresenceSession;
 use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System, UpdateKind};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use tracing::{debug, info, warn};
 
 mod cli;
@@ -76,8 +76,14 @@ fn sleep_interruptible(total: Duration) {
     }
 }
 
+/// Refresh the process table, **removing processes that have exited**.
+///
+/// `System::refresh_specifics` internally passes `remove_dead_processes: false`, so exited processes
+/// stayed in the snapshot forever. Once an agent CLI had been seen it matched for the rest of the
+/// daemon's life: presence kept showing an agent you had quit, `idle_mode = "clear"` never fired, and
+/// the session timer never reset. Call the explicit form so the second argument is visible.
 fn refresh_processes(sys: &mut System, need_cwd: bool) {
-    sys.refresh_specifics(RefreshKind::nothing().with_processes(process_refresh_kind(need_cwd)));
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, process_refresh_kind(need_cwd));
 }
 
 /// One process that satisfied one agent rule.
@@ -566,8 +572,14 @@ fn run_forever(mut state: RunState) {
         let entered_idle_clear = selected.is_none() && state.cfg.idle_mode == IdleMode::Clear;
 
         if entered_idle_clear {
-            if transition || state.first_tick {
+            let force = transition || state.first_tick;
+            if state.debouncer.should_send(PresenceAction::Clear, force) {
+                debug!("clearing presence (idle_mode = clear)");
                 state.sink.clear();
+            } else if force {
+                // A refused *forced* send can only be the rate limit: force already skips the
+                // equality check and the minimum interval.
+                warn!("clear suppressed by the Discord rate limit; is an agent process flapping?");
             }
             if transition {
                 state.session_start_unix = None;
@@ -601,16 +613,25 @@ fn run_forever(mut state: RunState) {
         );
 
         let force = transition || state.first_tick;
-        if state.debouncer.should_push(&view, force) {
+        if state
+            .debouncer
+            .should_send(PresenceAction::Set(&view), force)
+        {
             debug!(details = %view.details, state = %view.state, "pushing presence");
             state.sink.set(&view);
+        } else if force {
+            warn!(
+                details = %view.details,
+                "presence update suppressed by the Discord rate limit; is an agent process flapping?"
+            );
         }
 
         state.first_tick = false;
         sleep_interruptible(state.poll);
     }
 
-    // The whole point of trapping SIGTERM: never leave a stale activity behind.
+    // The one legitimate bypass of the debouncer: shutdown must always clear, rate limit or not.
+    // This is the whole point of trapping SIGTERM.
     state.sink.clear();
 }
 

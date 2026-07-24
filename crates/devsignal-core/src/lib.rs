@@ -464,41 +464,123 @@ pub struct PresenceView {
     pub start_timestamp_unix: Option<u64>,
 }
 
+/// Discord's documented RPC rate limit: 5 activity updates per 20 seconds, per client.
+pub const RATE_LIMIT_MAX_SENDS: usize = 5;
+pub const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(20);
+
+/// What the daemon wants to tell Discord this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresenceAction<'a> {
+    Set(&'a PresenceView),
+    /// `CLEAR_ACTIVITY` — used by `idle_mode = "clear"` and on shutdown.
+    Clear,
+}
+
+/// What the debouncer last told Discord, for equality-based deduplication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LastSent {
+    Set(PresenceView),
+    Clear,
+}
+
 #[derive(Debug, Clone)]
 pub struct Debouncer {
     min_interval: Duration,
-    last_payload: Option<PresenceView>,
+    max_sends: usize,
+    window: Duration,
+    last_sent: Option<LastSent>,
     last_push: Option<Instant>,
+    /// Timestamps of sends inside the current window, oldest first.
+    recent: std::collections::VecDeque<Instant>,
 }
 
 impl Debouncer {
     pub fn new(min_interval: Duration) -> Self {
+        Self::with_limits(min_interval, RATE_LIMIT_MAX_SENDS, RATE_LIMIT_WINDOW)
+    }
+
+    /// Same as [`Debouncer::new`] with the rate-limit window overridden, so tests need not sleep for
+    /// 20 seconds to exercise it.
+    pub fn with_limits(min_interval: Duration, max_sends: usize, window: Duration) -> Self {
         Self {
             min_interval,
-            last_payload: None,
+            max_sends,
+            window,
+            last_sent: None,
             last_push: None,
+            recent: std::collections::VecDeque::new(),
         }
     }
 
-    /// Returns `true` if Discord should be updated now.
-    pub fn should_push(&mut self, next: &PresenceView, force: bool) -> bool {
-        if force {
-            self.last_payload = Some(next.clone());
-            self.last_push = Some(Instant::now());
-            return true;
+    /// Adjust the minimum interval in place. Used by config hot-reload: rebuilding the debouncer
+    /// would discard the dedupe state and the rate-limit window along with it.
+    pub fn set_min_interval(&mut self, min_interval: Duration) {
+        self.min_interval = min_interval;
+    }
+
+    pub fn min_interval(&self) -> Duration {
+        self.min_interval
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while let Some(&front) = self.recent.front() {
+            if now.duration_since(front) >= self.window {
+                self.recent.pop_front();
+            } else {
+                break;
+            }
         }
-        if self.last_payload.as_ref() == Some(next) {
+    }
+
+    /// True when the sliding window is full. Checked even for forced sends: `force` exists to keep
+    /// agent transitions responsive, not to license unbounded IPC traffic.
+    pub fn rate_limited(&mut self, now: Instant) -> bool {
+        self.prune(now);
+        self.recent.len() >= self.max_sends
+    }
+
+    fn record(&mut self, sent: LastSent, now: Instant) {
+        self.last_sent = Some(sent);
+        self.last_push = Some(now);
+        self.recent.push_back(now);
+    }
+
+    /// Whether to send `action` to Discord now.
+    ///
+    /// `force` (an agent transition, or the first tick) skips the equality check and the
+    /// `min_push_interval_secs` wait, but **not** the rate limit. Without that last part, an agent
+    /// process that flaps in and out on alternate polls makes every tick a transition, and the daemon
+    /// writes to Discord every `poll_interval_secs` indefinitely.
+    pub fn should_send(&mut self, action: PresenceAction<'_>, force: bool) -> bool {
+        let now = Instant::now();
+        if self.rate_limited(now) {
             return false;
         }
-        let now = Instant::now();
+
+        let next = match action {
+            PresenceAction::Set(view) => LastSent::Set(view.clone()),
+            PresenceAction::Clear => LastSent::Clear,
+        };
+
+        if force {
+            self.record(next, now);
+            return true;
+        }
+        if self.last_sent.as_ref() == Some(&next) {
+            return false;
+        }
         if let Some(t) = self.last_push {
             if now.duration_since(t) < self.min_interval {
                 return false;
             }
         }
-        self.last_payload = Some(next.clone());
-        self.last_push = Some(now);
+        self.record(next, now);
         true
+    }
+
+    /// Convenience wrapper for the common case.
+    pub fn should_push(&mut self, next: &PresenceView, force: bool) -> bool {
+        self.should_send(PresenceAction::Set(next), force)
     }
 }
 
@@ -1385,6 +1467,107 @@ mod tests {
         assert!(!d.should_push(&b, false));
         std::thread::sleep(Duration::from_millis(450));
         assert!(d.should_push(&b, false));
+    }
+
+    fn view_named(details: &str) -> PresenceView {
+        PresenceView {
+            details: details.into(),
+            state: "s".into(),
+            large_image: "x".into(),
+            large_text: String::new(),
+            small_image: None,
+            small_text: None,
+            buttons: vec![],
+            start_timestamp_unix: None,
+        }
+    }
+
+    /// The regression: `force` used to return `true` before any rate check, so a flapping agent
+    /// produced one Discord write per poll tick forever.
+    #[test]
+    fn rate_limit_applies_even_to_forced_sends() {
+        // 3 sends per long window, so the cap is hit deterministically without sleeping.
+        let mut d = Debouncer::with_limits(Duration::from_millis(1), 3, Duration::from_secs(60));
+
+        for i in 0..3 {
+            assert!(
+                d.should_push(&view_named(&format!("v{i}")), true),
+                "send {i} should be allowed"
+            );
+        }
+        // Cap reached: further forced sends are refused despite `force`.
+        assert!(!d.should_push(&view_named("v3"), true));
+        assert!(!d.should_push(&view_named("v4"), true));
+        // And a non-forced one too.
+        assert!(!d.should_push(&view_named("v5"), false));
+    }
+
+    #[test]
+    fn rate_limit_window_slides() {
+        let mut d = Debouncer::with_limits(Duration::from_millis(1), 2, Duration::from_millis(300));
+        assert!(d.should_push(&view_named("a"), true));
+        assert!(d.should_push(&view_named("b"), true));
+        assert!(!d.should_push(&view_named("c"), true), "cap of 2 reached");
+
+        // Once the window rolls past the earlier sends, capacity returns.
+        std::thread::sleep(Duration::from_millis(350));
+        assert!(d.should_push(&view_named("c"), true));
+    }
+
+    /// `idle_mode = "clear"` used to bypass the debouncer entirely — it was not merely exempt from
+    /// the rate limit, it never consulted it.
+    #[test]
+    fn clears_go_through_the_same_limiter_as_sets() {
+        let mut d = Debouncer::with_limits(Duration::from_millis(1), 2, Duration::from_secs(60));
+        assert!(d.should_send(PresenceAction::Clear, true));
+        assert!(d.should_send(PresenceAction::Clear, true));
+        assert!(
+            !d.should_send(PresenceAction::Clear, true),
+            "clears must consume rate-limit budget too"
+        );
+    }
+
+    #[test]
+    fn a_repeated_clear_is_deduplicated() {
+        let mut d = Debouncer::with_limits(Duration::from_millis(1), 10, Duration::from_secs(60));
+        assert!(d.should_send(PresenceAction::Clear, false));
+        assert!(
+            !d.should_send(PresenceAction::Clear, false),
+            "an unchanged clear should not be resent"
+        );
+    }
+
+    /// Set-then-clear-then-set must not be deduplicated away: the actions differ.
+    #[test]
+    fn alternating_set_and_clear_are_distinct_payloads() {
+        let mut d = Debouncer::with_limits(Duration::ZERO, 10, Duration::from_secs(60));
+        let v = view_named("a");
+        assert!(d.should_send(PresenceAction::Set(&v), false));
+        assert!(d.should_send(PresenceAction::Clear, false));
+        assert!(d.should_send(PresenceAction::Set(&v), false));
+    }
+
+    #[test]
+    fn set_min_interval_preserves_dedupe_and_window_state() {
+        let mut d = Debouncer::with_limits(Duration::from_secs(60), 5, Duration::from_secs(60));
+        let v = view_named("a");
+        assert!(d.should_push(&v, true));
+        assert_eq!(d.min_interval(), Duration::from_secs(60));
+
+        // Hot-reload lowering the interval must not forget what was already sent.
+        d.set_min_interval(Duration::ZERO);
+        assert_eq!(d.min_interval(), Duration::ZERO);
+        assert!(
+            !d.should_push(&v, false),
+            "the identical payload should still be deduplicated after a reload"
+        );
+        assert!(d.should_push(&view_named("b"), false));
+    }
+
+    #[test]
+    fn default_limits_match_discords_documented_rate() {
+        assert_eq!(RATE_LIMIT_MAX_SENDS, 5);
+        assert_eq!(RATE_LIMIT_WINDOW, Duration::from_secs(20));
     }
 
     #[test]
