@@ -8,3 +8,4 @@ description = "macOS host-surface detection for devsignal"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
 objc2-app-kit.workspace = true
+tracing.workspace = true

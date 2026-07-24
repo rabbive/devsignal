@@ -42,7 +42,9 @@ cargo run -p devsignal-daemon -- init
 
 CI (`.github/workflows/ci.yml`): a Linux `lint` job runs `cargo fmt --check` plus clippy and tests
 for every crate except `devsignal-macos`, and a `macos` job runs workspace clippy, `cargo test`, and
-a release build. MSRV is Rust 1.74 (`workspace.package.rust-version`). `Cargo.lock` is committed.
+a release build, and an `msrv` job pins the declared `rust-version` so it stays a checked claim.
+MSRV is Rust **1.87** (`workspace.package.rust-version`) — determined empirically; the floor comes
+from the dependency graph as much as from our code. `Cargo.lock` is committed.
 
 `.github/workflows/release.yml` builds a universal macOS binary (`lipo` of aarch64 + x86_64) on `v*`
 tags, signing/notarizing when Apple credentials are present and publishing `SHA256SUMS`.
