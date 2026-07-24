@@ -233,17 +233,14 @@ fn default_priority() -> i32 {
 /// Built-in agent CLI presets — the single source of truth for `devsignal init` and the shipped
 /// `config.example.toml`. Both used to hardcode their own copy, which drifts.
 ///
-/// `process_names` matches the process name **or** the basename of `argv[0]`, case-insensitively,
-/// so Node- and Python-wrapped CLIs are covered without extra entries.
+/// **Only agents whose process names have been confirmed on a real machine live here.** A default
+/// that silently never matches is worse than no default: the daemon looks broken and the user has no
+/// way to tell a wrong `process_names` from "devsignal is not working". Ten further presets ship as
+/// opt-in snippets in `docs/community-presets.md`, to be confirmed with `devsignal detect` and added
+/// with `devsignal agents add`.
 ///
-/// Two caveats worth knowing before trusting a preset:
-///
-/// * **Binary names are best-effort.** These CLIs rename and re-package often. Run
-///   `devsignal detect` while the CLI is running to confirm what your machine actually reports,
-///   and adjust `process_names` in your own config if a preset misses.
-/// * **Some names are generic enough to collide** with unrelated tools (`goose` is also a Go
-///   database-migration tool; `amp` and `crush` are short). A false positive only mislabels the
-///   presence line; `devsignal agents disable <id>` turns any preset off.
+/// `process_names` matches the process name **or** the basename of `argv[0]`, case-insensitively, so
+/// Node- and Python-wrapped CLIs are covered without extra entries.
 ///
 /// `large_image` is a Discord art-asset **key**, not a URL — a key you have not uploaded in the
 /// Developer Portal renders blank. `devsignal init` prints the full list of keys to upload.
@@ -292,40 +289,12 @@ pub fn agent_presets() -> Vec<AgentRule> {
             Some(("Codex on GitHub", "https://github.com/openai/codex")),
         ),
         preset(
-            "gemini_cli",
-            "Gemini CLI",
-            &["gemini"],
-            30,
-            Some(("Gemini CLI", "https://github.com/google-gemini/gemini-cli")),
-        ),
-        preset(
             "opencode",
             "OpenCode",
             &["opencode"],
-            40,
+            30,
             Some(("OpenCode Docs", "https://opencode.ai")),
         ),
-        preset("amp", "Amp", &["amp"], 50, None),
-        preset("cursor_agent", "Cursor Agent", &["cursor-agent"], 60, None),
-        preset("copilot_cli", "Copilot CLI", &["copilot"], 70, None),
-        preset(
-            "aider",
-            "Aider",
-            &["aider"],
-            80,
-            Some(("Aider Docs", "https://aider.chat")),
-        ),
-        preset(
-            "crush",
-            "Crush",
-            &["crush"],
-            90,
-            Some(("Crush on GitHub", "https://github.com/charmbracelet/crush")),
-        ),
-        preset("qwen_code", "Qwen Code", &["qwen"], 100, None),
-        preset("droid", "Droid", &["droid"], 110, None),
-        preset("cline", "Cline", &["cline"], 120, None),
-        preset("goose", "Goose", &["goose"], 130, None),
     ]
 }
 
@@ -1076,10 +1045,19 @@ mod tests {
             .expect("shipped presets must be a valid config");
     }
 
+    /// The shipped table is deliberately limited to agents whose process names have been confirmed on
+    /// a real machine. Adding one here is a claim that it was verified with `devsignal detect`;
+    /// unconfirmed agents belong in `docs/community-presets.md`.
+    #[test]
+    fn shipped_presets_are_the_confirmed_set() {
+        let ids: Vec<String> = agent_presets().into_iter().map(|a| a.id).collect();
+        assert_eq!(ids, vec!["claude_code", "codex", "opencode"]);
+    }
+
     #[test]
     fn presets_have_unique_ids_and_priorities() {
         let presets = agent_presets();
-        assert!(presets.len() >= 10, "expected a broad preset table");
+        assert!(!presets.is_empty(), "at least one preset must ship");
 
         let mut ids: Vec<&str> = presets.iter().map(|a| a.id.as_str()).collect();
         ids.sort_unstable();
@@ -1169,6 +1147,92 @@ mod tests {
             assert!(
                 agent_presets().iter().any(|p| p.id == *id),
                 "config.example.toml has agent {id:?} with no matching preset"
+            );
+        }
+    }
+
+    /// Extract every ```toml fenced block from a markdown document.
+    fn toml_fences(markdown: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut current: Option<String> = None;
+        for line in markdown.lines() {
+            match (&mut current, line.trim_start()) {
+                (None, l) if l.starts_with("```toml") => current = Some(String::new()),
+                (Some(_), l) if l.starts_with("```") => {
+                    out.push(current.take().expect("in a fence"));
+                }
+                (Some(buf), _) => {
+                    buf.push_str(line);
+                    buf.push('\n');
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// The community presets are unverified *process names* — that is the user's to confirm. A
+    /// snippet that does not even parse, or that violates the config rules, is ours. This stops the
+    /// doc from rotting as validation tightens.
+    #[test]
+    fn community_preset_snippets_are_valid_config() {
+        let doc = include_str!("../../../docs/community-presets.md");
+        let fences = toml_fences(doc);
+        assert!(
+            fences.len() >= 10,
+            "expected a snippet per community preset, found {}",
+            fences.len()
+        );
+
+        let shipped: Vec<String> = agent_presets().into_iter().map(|a| a.id).collect();
+        let mut seen_ids = Vec::new();
+
+        for (idx, fence) in fences.iter().enumerate() {
+            // Each fence is an [[agents]] fragment; give it the minimum surrounding config.
+            let full = format!("[discord]\nclient_id = \"1\"\n\n{fence}");
+            let cfg: Config = toml::from_str(&full)
+                .unwrap_or_else(|e| panic!("snippet {idx} does not parse: {e}\n---\n{fence}"));
+            cfg.validate().unwrap_or_else(|e| {
+                panic!("snippet {idx} is not a valid config: {e:#}\n---\n{fence}")
+            });
+
+            for agent in cfg.agents {
+                // A community preset must not collide with a shipped one, or pasting it in produces a
+                // duplicate-id error the user did not cause.
+                assert!(
+                    !shipped.contains(&agent.id),
+                    "snippet {idx} reuses shipped preset id {:?}",
+                    agent.id
+                );
+                // Priorities must stay clear of the shipped band so ordering is predictable.
+                assert!(
+                    agent.priority >= 100,
+                    "snippet {idx} ({}) uses priority {} — community presets start at 100 to avoid \
+                     colliding with shipped presets",
+                    agent.id,
+                    agent.priority
+                );
+                seen_ids.push(agent.id);
+            }
+        }
+
+        // The button example intentionally repeats an id; ignore duplicates from that section by
+        // checking only that every documented agent id appears at least once.
+        for expected in [
+            "gemini_cli",
+            "amp",
+            "cursor_agent",
+            "copilot_cli",
+            "aider",
+            "crush",
+            "qwen_code",
+            "droid",
+            "cline",
+            "goose",
+        ] {
+            assert!(
+                seen_ids.iter().any(|id| id == expected),
+                "docs/community-presets.md is missing a snippet for {expected}"
             );
         }
     }

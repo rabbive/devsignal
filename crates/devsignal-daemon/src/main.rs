@@ -19,7 +19,7 @@ mod config_io;
 mod init;
 mod sink;
 
-use cli::{Cli, RunArgs};
+use cli::{Cli, DetectScope, RunArgs};
 use sink::{DiscordSink, PresenceSink, StdoutSink};
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
@@ -270,12 +270,101 @@ fn cmd_once(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Does this argv[0] look like something a user installed, rather than an OS daemon? Used to keep
+/// `detect --unmatched` readable: a Mac has hundreds of processes and almost none are agent CLIs.
+/// Deliberately generous — `--all` exists for when this filters out the thing you are looking for.
+fn looks_user_installed(argv0: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "/bin/",
+        "/homebrew/",
+        "/.local/",
+        "/.cargo/",
+        "/.bun/",
+        "/.deno/",
+        "/.volta/",
+        "/node_modules/.bin/",
+        "/.npm-global/",
+        "/.pyenv/",
+        "/.rbenv/",
+        "/pipx/",
+        "/.nvm/",
+    ];
+    // Bare names (no path at all) are worth showing: that is how a shim on PATH often appears.
+    if !argv0.contains('/') {
+        return true;
+    }
+    MARKERS.iter().any(|m| argv0.contains(m))
+}
+
+/// List processes that matched no agent rule — the discovery step for adding an agent whose process
+/// name you do not know yet.
+fn print_unmatched(sys: &System, cfg: &Config, unfiltered: bool) {
+    let matched: Vec<u32> = collect_matches(sys, cfg).iter().map(|c| c.pid).collect();
+
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for (pid, proc) in sys.processes() {
+        if proc.thread_kind().is_some() || matched.contains(&pid.as_u32()) {
+            continue;
+        }
+        let name = proc.name().to_string_lossy().to_string();
+        let argv0 = proc
+            .cmd()
+            .first()
+            .map(|a| a.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !unfiltered && !looks_user_installed(&argv0) {
+            continue;
+        }
+        rows.push((name, argv0));
+    }
+    rows.sort();
+    rows.dedup();
+
+    if rows.is_empty() {
+        println!("\nno unmatched processes to show.");
+        if !unfiltered {
+            println!("Try `devsignal detect --all` to list every process.");
+        }
+        return;
+    }
+
+    println!(
+        "\n{} unmatched process(es){}:",
+        rows.len(),
+        if unfiltered {
+            ""
+        } else {
+            " that look user-installed"
+        }
+    );
+    for (name, argv0) in &rows {
+        println!(
+            "  {:<24} argv0={}",
+            name,
+            if argv0.is_empty() { "<none>" } else { argv0 }
+        );
+    }
+    println!(
+        "\nTo track one of these:\n  \
+         devsignal agents add --id <id> --label \"<Label>\" --process-name <name>\n\
+         Matching is case-insensitive against the process name or the basename of argv0."
+    );
+    if !unfiltered {
+        println!("Not listed? `devsignal detect --all` skips the user-installed filter.");
+    }
+}
+
 /// Show every process that matched an agent rule, plus which one wins. This is the tool for
 /// answering "why isn't my agent detected?" — `agents list` only shows *configured* agents.
-fn cmd_detect(config_path: &Path) -> Result<()> {
+fn cmd_detect(config_path: &Path, scope: DetectScope) -> Result<()> {
     let cfg = load_config(config_path)?;
     let mut sys = System::new();
     refresh_processes(&mut sys, cfg.show_cwd_basename);
+
+    if let DetectScope::Unmatched | DetectScope::All = scope {
+        print_unmatched(&sys, &cfg, scope == DetectScope::All);
+        return Ok(());
+    }
 
     let bundle = devsignal_macos::frontmost_bundle_id();
     match &bundle {
@@ -387,7 +476,7 @@ fn main() {
         }
         Cli::Validate { config } => cmd_validate(&config),
         Cli::Once { config } => cmd_once(&config),
-        Cli::Detect { config } => cmd_detect(&config),
+        Cli::Detect { config, scope } => cmd_detect(&config, scope),
         Cli::Watch { config } => cmd_watch(&config),
         Cli::ConfigEdit(cmd) => config_edit::run_config_edit(cmd),
         Cli::Init { config } => require_macos("init").and_then(|()| init::cmd_init(&config)),
@@ -551,6 +640,36 @@ mod tests {
         let with_cwd = process_refresh_kind(true);
         assert_eq!(with_cwd.cwd(), UpdateKind::OnlyIfNotSet);
         assert_eq!(with_cwd.environ(), UpdateKind::Never);
+    }
+
+    #[test]
+    fn user_installed_heuristic_accepts_agent_cli_shapes() {
+        // The shapes agent CLIs actually take.
+        for argv0 in [
+            "/opt/homebrew/bin/gemini",
+            "/usr/local/bin/codex",
+            "/Users/me/.local/bin/aider",
+            "/Users/me/.bun/bin/opencode",
+            "/Users/me/.cargo/bin/devsignal",
+            "/Users/me/project/node_modules/.bin/cline",
+            "claude",
+        ] {
+            assert!(looks_user_installed(argv0), "{argv0} should be listed");
+        }
+    }
+
+    #[test]
+    fn user_installed_heuristic_filters_system_daemons() {
+        for argv0 in [
+            "/System/Library/PrivateFrameworks/X.framework/Support/xd",
+            "/usr/libexec/secinitd",
+            "/Applications/Safari.app/Contents/MacOS/Safari",
+        ] {
+            assert!(
+                !looks_user_installed(argv0),
+                "{argv0} should be filtered out"
+            );
+        }
     }
 
     #[test]

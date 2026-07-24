@@ -17,12 +17,24 @@ pub enum Cli {
     Run(RunArgs),
     Validate { config: PathBuf },
     Once { config: PathBuf },
-    Detect { config: PathBuf },
+    Detect { config: PathBuf, scope: DetectScope },
     Watch { config: PathBuf },
     Init { config: PathBuf },
     ConfigEdit(ConfigEditCommand),
     Help,
     Version,
+}
+
+/// What `devsignal detect` should report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectScope {
+    /// Processes that matched an agent rule (the default).
+    Matched,
+    /// Processes that matched nothing, filtered to plausible user-installed binaries — the discovery
+    /// step for adding an agent whose process name you do not know.
+    Unmatched,
+    /// Every process, unfiltered.
+    All,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -44,6 +56,7 @@ pub fn global_help() -> String {
            devsignal validate [-c path]   Parse and check the config, then exit\n\
            devsignal once     [-c path]   Print the presence payload as JSON (no Discord)\n\
            devsignal detect   [-c path]   Show which agent processes match, and which wins\n\
+           devsignal detect --unmatched   Running processes no rule matched (to find a name)\n\
            devsignal watch    [-c path]   Run the poll loop, printing instead of using Discord\n\
            devsignal hosts  list | enable <bundle_id> | disable <bundle_id>\n\
            devsignal agents list | enable <agent_id>  | disable <agent_id>\n\
@@ -103,6 +116,24 @@ fn parse_config_path_only(args: &[String]) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn parse_detect_args(args: &[String]) -> Result<(PathBuf, DetectScope)> {
+    let mut path = Config::default_path();
+    let mut scope = DetectScope::Matched;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--config" | "-c" => {
+                let p = it.next().context("--config requires a path")?;
+                path = PathBuf::from(p);
+            }
+            "--unmatched" => scope = DetectScope::Unmatched,
+            "--all" => scope = DetectScope::All,
+            other => anyhow::bail!("unknown argument: {other}"),
+        }
+    }
+    Ok((path, scope))
+}
+
 fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     let mut path = Config::default_path();
     let mut wait_for_discord = true;
@@ -153,9 +184,10 @@ pub fn parse_cli(args: &[String]) -> Result<Cli> {
         "once" => Ok(Cli::Once {
             config: parse_config_path_only(rest)?,
         }),
-        "detect" => Ok(Cli::Detect {
-            config: parse_config_path_only(rest)?,
-        }),
+        "detect" => {
+            let (config, scope) = parse_detect_args(rest)?;
+            Ok(Cli::Detect { config, scope })
+        }
         "watch" => Ok(Cli::Watch {
             config: parse_config_path_only(rest)?,
         }),
@@ -228,9 +260,9 @@ mod tests {
             let got = match cli {
                 Cli::Validate { config }
                 | Cli::Once { config }
-                | Cli::Detect { config }
                 | Cli::Watch { config }
                 | Cli::Init { config } => config,
+                Cli::Detect { config, .. } => config,
                 other => panic!("unexpected variant for {name}: {other:?}"),
             };
             assert_eq!(got, PathBuf::from("/tmp/x.toml"));
@@ -270,6 +302,26 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("unknown subcommand: ruls"), "got {msg}");
         assert!(msg.contains("--help"), "got {msg}");
+    }
+
+    #[test]
+    fn detect_scope_flags_parse() {
+        let scope_of = |args: &[&str]| match parse_cli(&argv(args)).expect("parse") {
+            Cli::Detect { scope, .. } => scope,
+            other => panic!("expected Detect, got {other:?}"),
+        };
+        assert_eq!(scope_of(&["detect"]), DetectScope::Matched);
+        assert_eq!(scope_of(&["detect", "--unmatched"]), DetectScope::Unmatched);
+        assert_eq!(scope_of(&["detect", "--all"]), DetectScope::All);
+        // Combined with --config, in either order.
+        match parse_cli(&argv(&["detect", "--unmatched", "-c", "/tmp/x.toml"])).expect("parse") {
+            Cli::Detect { config, scope } => {
+                assert_eq!(config, PathBuf::from("/tmp/x.toml"));
+                assert_eq!(scope, DetectScope::Unmatched);
+            }
+            other => panic!("expected Detect, got {other:?}"),
+        }
+        assert!(parse_cli(&argv(&["detect", "--bogus"])).is_err());
     }
 
     #[test]
