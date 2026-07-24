@@ -72,6 +72,12 @@ struct Candidate {
 fn collect_matches(sys: &System, cfg: &Config) -> Vec<Candidate> {
     let mut out = Vec::new();
     for (pid, proc) in sys.processes() {
+        // On Linux, sysinfo enumerates threads alongside processes, and every thread of an agent CLI
+        // inherits its argv[0] — so one running CLI would otherwise match a dozen times. Always
+        // `None` on macOS, where threads are not listed, so this is a no-op there.
+        if proc.thread_kind().is_some() {
+            continue;
+        }
         let name = proc.name().to_string_lossy();
         let cmd = proc.cmd();
         for rule in &cfg.agents {

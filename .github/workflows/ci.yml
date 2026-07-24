@@ -24,8 +24,13 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
+      # Everything except devsignal-macos, which needs the macOS SDK. The daemon is included
+      # because CLI parsing and the run loop are no longer behind `cfg(target_os = "macos")`.
       - name: cargo clippy (linux-safe crates)
-        run: cargo clippy -p devsignal-core -p devsignal-discord --all-targets -- -D warnings
+        run: cargo clippy -p devsignal-core -p devsignal-discord -p devsignal-daemon --all-targets -- -D warnings
+
+      - name: cargo test (linux-safe crates)
+        run: cargo test -p devsignal-core -p devsignal-daemon
 
   macos:
     runs-on: macos-latest

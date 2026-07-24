@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use console::style;
 use devsignal_core::{
-    parse_numeric_id, AgentRule, ButtonConfig, Config, DiscordSection, IdleMode, PlatformsConfig,
+    agent_presets, parse_numeric_id, AgentRule, Config, DiscordSection, IdleMode, PlatformsConfig,
     PresenceRule, RuleThen, RuleWhen, TimeWindow, HOST_BUNDLE_LABELS,
 };
 use dialoguer::{Confirm, Input, MultiSelect, Select};
@@ -9,11 +9,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// How much detail reaches Discord. These must differ in behaviour, not just in wording:
+/// `Minimal` hides the host via a catch-all rule, `Balanced` shows the host, `Detailed` adds the
+/// project directory name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrivacyPreset {
     Minimal,
-    ProjectSafe,
-    PublicOss,
+    Balanced,
+    Detailed,
     Custom,
 }
 
@@ -26,51 +29,10 @@ fn banner() -> &'static str {
 ╚═════╝ ╚══════╝  ╚═══╝  ╚══════╝╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═╝╚══════╝"#
 }
 
+/// The shipped preset table lives in `devsignal-core` so the wizard and `config.example.toml`
+/// cannot drift apart.
 fn default_agents() -> Vec<AgentRule> {
-    vec![
-        AgentRule {
-            id: "claude_code".to_string(),
-            label: Some("Claude Code".to_string()),
-            process_names: vec!["claude".to_string(), "claude-code".to_string()],
-            argv_substrings: vec![],
-            large_image: Some("claude".to_string()),
-            priority: 10,
-            small_image: Some("devsignal".to_string()),
-            small_text: Some("devsignal".to_string()),
-            buttons: vec![ButtonConfig {
-                label: "Claude Code Docs".to_string(),
-                url: "https://claude.ai/code".to_string(),
-            }],
-        },
-        AgentRule {
-            id: "codex".to_string(),
-            label: Some("Codex".to_string()),
-            process_names: vec!["codex".to_string()],
-            argv_substrings: vec![],
-            large_image: Some("codex".to_string()),
-            priority: 20,
-            small_image: Some("devsignal".to_string()),
-            small_text: Some("devsignal".to_string()),
-            buttons: vec![ButtonConfig {
-                label: "Codex on GitHub".to_string(),
-                url: "https://github.com/openai/codex".to_string(),
-            }],
-        },
-        AgentRule {
-            id: "opencode".to_string(),
-            label: Some("OpenCode".to_string()),
-            process_names: vec!["opencode".to_string()],
-            argv_substrings: vec![],
-            large_image: Some("opencode".to_string()),
-            priority: 30,
-            small_image: Some("devsignal".to_string()),
-            small_text: Some("devsignal".to_string()),
-            buttons: vec![ButtonConfig {
-                label: "OpenCode Docs".to_string(),
-                url: "https://opencode.ai".to_string(),
-            }],
-        },
-    ]
+    agent_presets()
 }
 
 fn generate_config(
@@ -113,33 +75,58 @@ fn write_config_file(path: &Path, cfg: &Config, overwrite: bool) -> Result<()> {
 
 fn choose_privacy_preset() -> Result<PrivacyPreset> {
     let items = vec![
-        "Minimal (agent + host only)",
-        "Project-safe (agent + host + project basename)",
-        "Public/OSS (polished copy, no project names by default)",
+        "Minimal — agent only (host hidden)",
+        "Balanced — agent + editor/terminal",
+        "Detailed — agent + editor/terminal + project folder name",
         "Custom",
     ];
     let idx = Select::new()
-        .with_prompt("Choose a privacy preset")
+        .with_prompt("How much should Discord show?")
         .items(&items)
-        .default(2)
+        .default(1)
         .interact()
         .context("read preset selection")?;
 
     Ok(match idx {
         0 => PrivacyPreset::Minimal,
-        1 => PrivacyPreset::ProjectSafe,
-        2 => PrivacyPreset::PublicOss,
+        1 => PrivacyPreset::Balanced,
+        2 => PrivacyPreset::Detailed,
         _ => PrivacyPreset::Custom,
     })
 }
 
+/// `Minimal` needs a catch-all rule to suppress the host label. It goes *last* so any rule the user
+/// picked in `choose_rule_presets` still wins under first-match-wins.
+fn privacy_preset_rules(preset: PrivacyPreset) -> Vec<PresenceRule> {
+    if preset != PrivacyPreset::Minimal {
+        return vec![];
+    }
+    vec![PresenceRule {
+        name: "minimal_hide_host".into(),
+        when: RuleWhen::default(),
+        then: RuleThen {
+            hide_host: true,
+            state: None,
+        },
+    }]
+}
+
 fn choose_agents() -> Result<Vec<AgentRule>> {
     let defaults = default_agents();
-    let labels = vec!["Claude Code", "Codex", "OpenCode"];
+    let labels = defaults
+        .iter()
+        .map(|a| {
+            let name = a.label.clone().unwrap_or_else(|| a.id.clone());
+            format!("{name} ({})", a.process_names.join(", "))
+        })
+        .collect::<Vec<_>>();
+    let all = vec![true; labels.len()];
     let selections = MultiSelect::new()
-        .with_prompt("Select which agent rules to include")
+        .with_prompt(
+            "Select which agent CLIs to watch (space toggles; a rule only matters when that CLI runs)",
+        )
         .items(&labels)
-        .defaults(&[true, true, true])
+        .defaults(&all)
         .interact()
         .context("read agent selection")?;
 
@@ -458,8 +445,8 @@ pub fn cmd_init(config_path: &Path) -> Result<()> {
 
     let preset = choose_privacy_preset()?;
     let show_cwd_basename = match preset {
-        PrivacyPreset::Minimal | PrivacyPreset::PublicOss => false,
-        PrivacyPreset::ProjectSafe => true,
+        PrivacyPreset::Minimal | PrivacyPreset::Balanced => false,
+        PrivacyPreset::Detailed => true,
         PrivacyPreset::Custom => Confirm::new()
             .with_prompt("Show project basename (CWD leaf) in Discord?")
             .default(false)
@@ -473,15 +460,30 @@ pub fn cmd_init(config_path: &Path) -> Result<()> {
         "at least one agent must be selected (Config requires [[agents]])"
     );
     let disabled_hosts = choose_disabled_hosts()?;
-    let rules = choose_rule_presets()?;
+    // User-chosen rules first, then any rule the privacy preset implies, so the explicit choice
+    // wins under first-match-wins.
+    let mut rules = choose_rule_presets()?;
+    rules.extend(privacy_preset_rules(preset));
 
     println!();
-    println!("{}", style("Art assets (optional for now):").bold());
-    println!("If you want images later, upload keys under Discord Developer Portal → Rich Presence → Art Assets:");
-    println!("  - devsignal");
-    println!("  - claude");
-    println!("  - codex");
-    println!("  - opencode");
+    println!("{}", style("Art assets").bold());
+    println!(
+        "Presence images are Discord asset KEYS, uploaded under\n\
+         Developer Portal → Rich Presence → Art Assets. A key you have not uploaded renders blank —\n\
+         remove the large_image line for that agent to fall back to \"devsignal\"."
+    );
+    println!("Keys referenced by your selection:");
+    let mut keys = vec!["devsignal".to_string()];
+    for agent in &agents {
+        if let Some(key) = &agent.large_image {
+            if !keys.contains(key) {
+                keys.push(key.clone());
+            }
+        }
+    }
+    for key in &keys {
+        println!("  - {key}");
+    }
     println!();
 
     let overwrite = if config_path.exists() {
@@ -505,9 +507,7 @@ pub fn cmd_init(config_path: &Path) -> Result<()> {
         rules,
     );
     write_config_file(config_path, &cfg, overwrite)?;
-
-    // Validate by re-loading from disk (uses core validation).
-    let _ = Config::load_from_path(config_path).context("validate written config")?;
+    // write_config_atomic validates before replacing the file, so reaching here means it loads.
 
     println!();
     println!("{}", style("Config written and validated.").green().bold());
@@ -529,5 +529,80 @@ mod tests {
         assert!(cfg.show_cwd_basename);
         assert_eq!(cfg.discord.client_id, "1");
         assert!(!cfg.agents.is_empty());
+    }
+
+    #[test]
+    fn wizard_defaults_come_from_the_core_preset_table() {
+        let wizard: Vec<String> = default_agents().into_iter().map(|a| a.id).collect();
+        let core: Vec<String> = agent_presets().into_iter().map(|a| a.id).collect();
+        assert_eq!(wizard, core);
+    }
+
+    #[test]
+    fn generated_config_from_presets_is_valid() {
+        let cfg = generate_config("123456789".into(), false, default_agents(), vec![], vec![]);
+        cfg.validate().expect("wizard output must load");
+    }
+
+    /// Regression: the old `PublicOss` preset was byte-identical in behaviour to `Minimal`.
+    #[test]
+    fn each_privacy_preset_produces_a_distinct_config() {
+        let shape = |preset: PrivacyPreset, show_cwd: bool| {
+            let cfg = generate_config(
+                "123456789".into(),
+                show_cwd,
+                default_agents(),
+                vec![],
+                privacy_preset_rules(preset),
+            );
+            cfg.validate().expect("preset output must load");
+            (cfg.show_cwd_basename, cfg.rules.len())
+        };
+
+        let minimal = shape(PrivacyPreset::Minimal, false);
+        let balanced = shape(PrivacyPreset::Balanced, false);
+        let detailed = shape(PrivacyPreset::Detailed, true);
+
+        assert_ne!(minimal, balanced, "Minimal and Balanced must differ");
+        assert_ne!(balanced, detailed, "Balanced and Detailed must differ");
+        assert_ne!(minimal, detailed, "Minimal and Detailed must differ");
+
+        // Minimal is the only one that needs a rule, and it hides the host.
+        assert_eq!(minimal.1, 1);
+        assert_eq!(balanced.1, 0);
+        assert_eq!(detailed.1, 0);
+    }
+
+    #[test]
+    fn minimal_privacy_rule_hides_host_and_is_a_catch_all() {
+        let rules = privacy_preset_rules(PrivacyPreset::Minimal);
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].then.hide_host);
+        assert!(rules[0].then.state.is_none());
+        // A catch-all `when` is what makes it a fallback for every situation.
+        assert!(rules[0].when.host_bundle_ids.is_empty());
+        assert!(rules[0].when.agent_ids.is_empty());
+        assert!(!rules[0].when.active_only);
+        assert!(!rules[0].when.idle_only);
+
+        for other in [PrivacyPreset::Balanced, PrivacyPreset::Detailed] {
+            assert!(privacy_preset_rules(other).is_empty());
+        }
+    }
+
+    /// The privacy fallback must not shadow a rule the user explicitly chose.
+    #[test]
+    fn privacy_rule_is_appended_after_user_rules() {
+        let mut rules = vec![PresenceRule {
+            name: "user_rule".into(),
+            when: RuleWhen::default(),
+            then: RuleThen {
+                hide_host: false,
+                state: Some("Streaming".into()),
+            },
+        }];
+        rules.extend(privacy_preset_rules(PrivacyPreset::Minimal));
+        assert_eq!(rules[0].name, "user_rule");
+        assert_eq!(rules[1].name, "minimal_hide_host");
     }
 }
