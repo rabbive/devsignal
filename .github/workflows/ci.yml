@@ -32,6 +32,13 @@ jobs:
       - name: cargo test (linux-safe crates)
         run: cargo test -p devsignal-core -p devsignal-daemon
 
+      # install.sh is the only install path now that the Homebrew formula is gone, so it is worth
+      # linting. Not available in every dev environment, which is why it runs here.
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck packaging/macos/install.sh scripts/*.sh
+
   # The declared MSRV was 1.74 for months while the code needed 1.87; both other jobs use `stable`,
   # so nothing caught it. This job makes rust-version a checked claim.
   msrv:
