@@ -175,9 +175,22 @@ fn load_config(path: &Path) -> Result<Config> {
 }
 
 fn write_config(path: &Path, cfg: &Config) -> Result<()> {
-    let toml = toml::to_string_pretty(cfg).context("serialize config")?;
-    std::fs::write(path, toml).with_context(|| format!("write config {}", path.display()))?;
-    let _ = Config::load_from_path(path).context("validate rewritten config")?;
+    crate::config_io::write_config_atomic(path, cfg)
+}
+
+/// Persist the change, then report it. Rewriting the config from the parsed struct drops comments,
+/// and a running daemon reads its config only at startup — say both out loud rather than letting the
+/// user wonder why nothing happened.
+fn commit(path: &Path, cfg: &Config, message: &str) -> Result<()> {
+    write_config(path, cfg)?;
+    println!("{message}");
+    println!(
+        "  wrote {} (comments and key order are not preserved)",
+        path.display()
+    );
+    println!(
+        "  restart the daemon to apply: launchctl kickstart -k gui/$(id -u)/com.devsignal.daemon"
+    );
     Ok(())
 }
 
@@ -221,16 +234,12 @@ fn run_hosts(cmd: HostsCommand) -> Result<()> {
         HostsCommand::Enable { config, id } => {
             let mut cfg = load_config(&config)?;
             remove_case_insensitive(&mut cfg.platforms.disabled_hosts, &id);
-            write_config(&config, &cfg)?;
-            println!("enabled host: {id}");
-            Ok(())
+            commit(&config, &cfg, &format!("enabled host: {id}"))
         }
         HostsCommand::Disable { config, id } => {
             let mut cfg = load_config(&config)?;
             add_unique_case_insensitive(&mut cfg.platforms.disabled_hosts, id.clone());
-            write_config(&config, &cfg)?;
-            println!("disabled host: {id}");
-            Ok(())
+            commit(&config, &cfg, &format!("disabled host: {id}"))
         }
     }
 }
@@ -257,16 +266,12 @@ fn run_agents(cmd: AgentsCommand) -> Result<()> {
         AgentsCommand::Enable { config, id } => {
             let mut cfg = load_config(&config)?;
             remove_case_insensitive(&mut cfg.platforms.disabled_agents, &id);
-            write_config(&config, &cfg)?;
-            println!("enabled agent: {id}");
-            Ok(())
+            commit(&config, &cfg, &format!("enabled agent: {id}"))
         }
         AgentsCommand::Disable { config, id } => {
             let mut cfg = load_config(&config)?;
             add_unique_case_insensitive(&mut cfg.platforms.disabled_agents, id.clone());
-            write_config(&config, &cfg)?;
-            println!("disabled agent: {id}");
-            Ok(())
+            commit(&config, &cfg, &format!("disabled agent: {id}"))
         }
     }
 }
@@ -288,9 +293,7 @@ fn run_rules(cmd: RulesCommand) -> Result<()> {
             let before = cfg.rules.len();
             cfg.rules.retain(|rule| rule.name != name);
             anyhow::ensure!(cfg.rules.len() != before, "rule not found: {name}");
-            write_config(&config, &cfg)?;
-            println!("removed rule: {name}");
-            Ok(())
+            commit(&config, &cfg, &format!("removed rule: {name}"))
         }
         RulesCommand::Add { config, rule } => {
             let mut cfg = load_config(&config)?;
@@ -301,9 +304,7 @@ fn run_rules(cmd: RulesCommand) -> Result<()> {
             );
             let name = rule.name.clone();
             cfg.rules.push(rule);
-            write_config(&config, &cfg)?;
-            println!("added rule: {name}");
-            Ok(())
+            commit(&config, &cfg, &format!("added rule: {name}"))
         }
     }
 }

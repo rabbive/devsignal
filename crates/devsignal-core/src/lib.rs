@@ -97,6 +97,13 @@ pub struct AgentRule {
     pub buttons: Vec<ButtonConfig>,
 }
 
+/// Discord's documented limits for the activity fields devsignal populates. Exceeding any of them
+/// makes Discord reject the whole payload, which surfaces only as a `warn!` — so these are enforced
+/// at config-load time instead.
+pub const BUTTON_LABEL_MAX_CHARS: usize = 32;
+pub const BUTTON_URL_MAX_CHARS: usize = 512;
+pub const MAX_BUTTONS: usize = 2;
+
 /// A Discord Rich Presence button (label + URL). Maximum 2 per presence payload.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ButtonConfig {
@@ -104,6 +111,56 @@ pub struct ButtonConfig {
     pub label: String,
     /// URL opened when the button is clicked (1–512 characters).
     pub url: String,
+}
+
+impl ButtonConfig {
+    pub fn validate(&self) -> Result<()> {
+        let label = self.label.trim();
+        anyhow::ensure!(!label.is_empty(), "button label must not be empty");
+        // Discord counts characters, not bytes.
+        let label_len = self.label.chars().count();
+        anyhow::ensure!(
+            label_len <= BUTTON_LABEL_MAX_CHARS,
+            "button label {:?} is {} characters; Discord allows at most {}",
+            self.label,
+            label_len,
+            BUTTON_LABEL_MAX_CHARS
+        );
+
+        anyhow::ensure!(
+            !self.url.trim().is_empty(),
+            "button {:?} must have a url",
+            self.label
+        );
+        let url_len = self.url.chars().count();
+        anyhow::ensure!(
+            url_len <= BUTTON_URL_MAX_CHARS,
+            "button {:?} url is {} characters; Discord allows at most {}",
+            self.label,
+            url_len,
+            BUTTON_URL_MAX_CHARS
+        );
+        anyhow::ensure!(
+            self.url.starts_with("http://") || self.url.starts_with("https://"),
+            "button {:?} url must start with http:// or https:// (got {:?})",
+            self.label,
+            self.url
+        );
+        Ok(())
+    }
+}
+
+/// A Discord Application ID is an opaque numeric snowflake. Rejecting non-numeric values at
+/// config-load time avoids a misleading "is Discord running?" failure at IPC connect.
+pub fn parse_numeric_id(raw: &str) -> Result<String> {
+    let s = raw.trim();
+    anyhow::ensure!(!s.is_empty(), "Discord Application ID cannot be empty");
+    anyhow::ensure!(
+        s.chars().all(|c| c.is_ascii_digit()),
+        "Discord Application ID must be numeric (got {s:?}); \
+         copy it from https://discord.com/developers/applications"
+    );
+    Ok(s.to_string())
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -197,14 +254,109 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        anyhow::ensure!(
-            !self.discord.client_id.trim().is_empty(),
-            "discord.client_id must be set"
-        );
+        parse_numeric_id(&self.discord.client_id).context("discord.client_id")?;
         anyhow::ensure!(
             !self.agents.is_empty(),
             "at least one [[agents]] entry is required"
         );
+
+        let mut seen_ids: Vec<&str> = Vec::new();
+        for agent in &self.agents {
+            agent
+                .validate()
+                .with_context(|| format!("[[agents]] id={}", agent.id))?;
+            anyhow::ensure!(
+                !seen_ids.contains(&agent.id.as_str()),
+                "duplicate [[agents]] id: {}",
+                agent.id
+            );
+            seen_ids.push(&agent.id);
+        }
+
+        let mut seen_rules: Vec<&str> = Vec::new();
+        for rule in &self.rules {
+            rule.validate()
+                .with_context(|| format!("[[rules]] name={}", rule.name))?;
+            anyhow::ensure!(
+                !seen_rules.contains(&rule.name.as_str()),
+                "duplicate [[rules]] name: {}",
+                rule.name
+            );
+            seen_rules.push(&rule.name);
+        }
+        Ok(())
+    }
+}
+
+impl AgentRule {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(!self.id.trim().is_empty(), "agent id must not be empty");
+        // `process_matches_rule` requires a `process_names` hit before it even looks at
+        // `argv_substrings`, so an entry without one can never match anything.
+        anyhow::ensure!(
+            !self.process_names.is_empty(),
+            "agent {:?} has no process_names, so it can never match a process",
+            self.id
+        );
+        anyhow::ensure!(
+            self.buttons.len() <= MAX_BUTTONS,
+            "agent {:?} declares {} buttons; Discord shows at most {}. \
+             Remove the extras rather than relying on truncation.",
+            self.id,
+            self.buttons.len(),
+            MAX_BUTTONS
+        );
+        for button in &self.buttons {
+            button.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl TimeWindow {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            parse_hhmm_minutes(&self.start).is_some(),
+            "time window start {:?} is not HH:MM (24-hour)",
+            self.start
+        );
+        anyhow::ensure!(
+            parse_hhmm_minutes(&self.end).is_some(),
+            "time window end {:?} is not HH:MM (24-hour)",
+            self.end
+        );
+        Ok(())
+    }
+}
+
+impl PresenceRule {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(!self.name.trim().is_empty(), "rule name must not be empty");
+        // `apply_rules` returns on the first `when` match regardless of `then`, so a rule that
+        // changes nothing would silently shadow every rule after it.
+        anyhow::ensure!(
+            self.then.hide_host || self.then.state.is_some(),
+            "rule {:?} does nothing: set then.hide_host and/or then.state. \
+             An empty `then` still matches and would block every later rule.",
+            self.name
+        );
+        if let Some(state) = &self.then.state {
+            anyhow::ensure!(
+                !state.trim().is_empty(),
+                "rule {:?} has an empty then.state",
+                self.name
+            );
+        }
+        anyhow::ensure!(
+            !(self.when.active_only && self.when.idle_only),
+            "rule {:?} sets both active_only and idle_only, so it can never match",
+            self.name
+        );
+        if let Some(window) = &self.when.time {
+            window
+                .validate()
+                .with_context(|| format!("rule {:?}", self.name))?;
+        }
         Ok(())
     }
 }
@@ -550,6 +702,258 @@ mod tests {
             platforms: PlatformsConfig::default(),
             rules: vec![],
         }
+    }
+
+    /// A config that passes `validate()`, for tests that mutate one thing and expect a rejection.
+    fn valid_config() -> Config {
+        let mut cfg = sample_config();
+        cfg.agents = vec![AgentRule {
+            id: "claude_code".into(),
+            label: None,
+            process_names: vec!["claude".into()],
+            argv_substrings: vec![],
+            large_image: None,
+            priority: 10,
+            small_image: None,
+            small_text: None,
+            buttons: vec![],
+        }];
+        cfg
+    }
+
+    fn err_of(cfg: &Config) -> String {
+        format!(
+            "{:#}",
+            cfg.validate().expect_err("expected validation error")
+        )
+    }
+
+    #[test]
+    fn valid_config_passes_validation() {
+        valid_config().validate().expect("should be valid");
+    }
+
+    #[test]
+    fn parse_numeric_id_rejects_non_digits() {
+        assert!(parse_numeric_id("abc").is_err());
+        assert!(parse_numeric_id("123a").is_err());
+        assert!(parse_numeric_id("").is_err());
+        assert_eq!(parse_numeric_id("123").unwrap(), "123");
+        assert_eq!(parse_numeric_id("  123  ").unwrap(), "123");
+    }
+
+    #[test]
+    fn validate_rejects_non_numeric_client_id() {
+        let mut cfg = valid_config();
+        // The value config.example.toml ships with, so this is the first thing a new user hits.
+        cfg.discord.client_id = "YOUR_DISCORD_APPLICATION_ID".into();
+        let msg = err_of(&cfg);
+        assert!(msg.contains("client_id"), "got {msg}");
+        assert!(msg.contains("numeric"), "got {msg}");
+    }
+
+    #[test]
+    fn validate_requires_at_least_one_agent() {
+        let mut cfg = valid_config();
+        cfg.agents.clear();
+        assert!(err_of(&cfg).contains("[[agents]]"));
+    }
+
+    #[test]
+    fn validate_rejects_agent_without_process_names() {
+        let mut cfg = valid_config();
+        cfg.agents[0].process_names.clear();
+        let msg = err_of(&cfg);
+        assert!(msg.contains("process_names"), "got {msg}");
+        assert!(msg.contains("never match"), "got {msg}");
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_agent_ids() {
+        let mut cfg = valid_config();
+        let dup = cfg.agents[0].clone();
+        cfg.agents.push(dup);
+        assert!(err_of(&cfg).contains("duplicate"));
+    }
+
+    #[test]
+    fn validate_rejects_more_than_two_buttons() {
+        let mut cfg = valid_config();
+        cfg.agents[0].buttons = (0..3)
+            .map(|i| ButtonConfig {
+                label: format!("b{i}"),
+                url: "https://example.com".into(),
+            })
+            .collect();
+        let msg = err_of(&cfg);
+        assert!(msg.contains("3 buttons"), "got {msg}");
+        assert!(msg.contains("truncation"), "got {msg}");
+    }
+
+    #[test]
+    fn validate_rejects_overlong_button_label() {
+        let mut cfg = valid_config();
+        cfg.agents[0].buttons = vec![ButtonConfig {
+            label: "x".repeat(BUTTON_LABEL_MAX_CHARS + 1),
+            url: "https://example.com".into(),
+        }];
+        assert!(err_of(&cfg).contains("characters"));
+
+        // Exactly at the limit is fine.
+        let mut ok = valid_config();
+        ok.agents[0].buttons = vec![ButtonConfig {
+            label: "x".repeat(BUTTON_LABEL_MAX_CHARS),
+            url: "https://example.com".into(),
+        }];
+        ok.validate().expect("boundary label should be accepted");
+    }
+
+    #[test]
+    fn button_label_limit_counts_characters_not_bytes() {
+        // 32 multi-byte characters is 96 bytes but a legal Discord label.
+        let label = "é".repeat(BUTTON_LABEL_MAX_CHARS);
+        assert!(label.len() > BUTTON_LABEL_MAX_CHARS);
+        let mut cfg = valid_config();
+        cfg.agents[0].buttons = vec![ButtonConfig {
+            label,
+            url: "https://example.com".into(),
+        }];
+        cfg.validate()
+            .expect("32 chars should pass regardless of byte length");
+    }
+
+    #[test]
+    fn validate_rejects_bad_button_urls() {
+        for bad in [
+            "",
+            "example.com",
+            "ftp://example.com",
+            "javascript:alert(1)",
+        ] {
+            let mut cfg = valid_config();
+            cfg.agents[0].buttons = vec![ButtonConfig {
+                label: "Docs".into(),
+                url: bad.into(),
+            }];
+            assert!(
+                cfg.validate().is_err(),
+                "url {bad:?} should have been rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_overlong_button_url() {
+        let mut cfg = valid_config();
+        let long = format!("https://example.com/{}", "a".repeat(BUTTON_URL_MAX_CHARS));
+        cfg.agents[0].buttons = vec![ButtonConfig {
+            label: "Docs".into(),
+            url: long,
+        }];
+        assert!(err_of(&cfg).contains("at most"));
+    }
+
+    fn rule_named(name: &str) -> PresenceRule {
+        PresenceRule {
+            name: name.into(),
+            when: RuleWhen::default(),
+            then: RuleThen {
+                hide_host: true,
+                state: None,
+            },
+        }
+    }
+
+    #[test]
+    fn validate_rejects_rule_with_empty_then() {
+        let mut cfg = valid_config();
+        cfg.rules = vec![PresenceRule {
+            name: "noop".into(),
+            when: RuleWhen::default(),
+            then: RuleThen::default(),
+        }];
+        let msg = err_of(&cfg);
+        assert!(msg.contains("does nothing"), "got {msg}");
+        assert!(msg.contains("block every later rule"), "got {msg}");
+    }
+
+    #[test]
+    fn validate_rejects_rule_that_is_both_active_and_idle_only() {
+        let mut cfg = valid_config();
+        let mut rule = rule_named("impossible");
+        rule.when.active_only = true;
+        rule.when.idle_only = true;
+        cfg.rules = vec![rule];
+        assert!(err_of(&cfg).contains("never match"));
+    }
+
+    #[test]
+    fn validate_rejects_unparseable_time_windows() {
+        // Each of these previously produced a rule that silently never matched.
+        for (start, end) in [
+            ("9", "17"),
+            ("0900", "1700"),
+            ("25:00", "26:00"),
+            ("09:60", "17:00"),
+            ("", ""),
+        ] {
+            let mut cfg = valid_config();
+            let mut rule = rule_named("window");
+            rule.when.time = Some(TimeWindow {
+                start: start.into(),
+                end: end.into(),
+            });
+            cfg.rules = vec![rule];
+            assert!(
+                cfg.validate().is_err(),
+                "time window {start:?}-{end:?} should have been rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_overnight_time_window() {
+        let mut cfg = valid_config();
+        let mut rule = rule_named("after_hours");
+        rule.when.time = Some(TimeWindow {
+            start: "22:00".into(),
+            end: "06:00".into(),
+        });
+        cfg.rules = vec![rule];
+        cfg.validate().expect("overnight windows are legal");
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_rule_names_and_empty_state() {
+        let mut cfg = valid_config();
+        cfg.rules = vec![rule_named("dup"), rule_named("dup")];
+        assert!(err_of(&cfg).contains("duplicate"));
+
+        let mut cfg2 = valid_config();
+        cfg2.rules = vec![PresenceRule {
+            name: "blank".into(),
+            when: RuleWhen::default(),
+            then: RuleThen {
+                hide_host: false,
+                state: Some("   ".into()),
+            },
+        }];
+        assert!(err_of(&cfg2).contains("empty then.state"));
+    }
+
+    #[test]
+    fn validation_errors_name_the_offending_entry() {
+        let mut cfg = valid_config();
+        cfg.agents[0].id = "codex".into();
+        cfg.agents[0].buttons = vec![ButtonConfig {
+            label: "Docs".into(),
+            url: "nope".into(),
+        }];
+        let msg = err_of(&cfg);
+        assert!(
+            msg.contains("codex"),
+            "error should locate the agent: {msg}"
+        );
     }
 
     #[test]

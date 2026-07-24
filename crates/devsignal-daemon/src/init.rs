@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use console::style;
 use devsignal_core::{
-    AgentRule, ButtonConfig, Config, DiscordSection, IdleMode, PlatformsConfig, PresenceRule,
-    RuleThen, RuleWhen, TimeWindow, HOST_BUNDLE_LABELS,
+    parse_numeric_id, AgentRule, ButtonConfig, Config, DiscordSection, IdleMode, PlatformsConfig,
+    PresenceRule, RuleThen, RuleWhen, TimeWindow, HOST_BUNDLE_LABELS,
 };
 use dialoguer::{Confirm, Input, MultiSelect, Select};
 use std::fs;
@@ -24,16 +24,6 @@ fn banner() -> &'static str {
 ██║  ██║██╔══╝  ╚██╗ ██╔╝╚════██║██║██║   ██║██║╚██╗██║██╔══██║██║
 ██████╔╝███████╗ ╚████╔╝ ███████║██║╚██████╔╝██║ ╚████║██║  ██║███████╗
 ╚═════╝ ╚══════╝  ╚═══╝  ╚══════╝╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═╝╚══════╝"#
-}
-
-fn parse_numeric_id(raw: &str) -> Result<String> {
-    let s = raw.trim();
-    anyhow::ensure!(!s.is_empty(), "Discord Application ID cannot be empty");
-    anyhow::ensure!(
-        s.chars().all(|c| c.is_ascii_digit()),
-        "Discord Application ID must be numeric"
-    );
-    Ok(s.to_string())
 }
 
 fn default_agents() -> Vec<AgentRule> {
@@ -118,13 +108,7 @@ fn write_config_file(path: &Path, cfg: &Config, overwrite: bool) -> Result<()> {
             path.display()
         );
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create config directory {}", parent.display()))?;
-    }
-    let toml = toml::to_string_pretty(cfg).context("serialize config to TOML")?;
-    fs::write(path, toml).with_context(|| format!("write config {}", path.display()))?;
-    Ok(())
+    crate::config_io::write_config_atomic(path, cfg)
 }
 
 fn choose_privacy_preset() -> Result<PrivacyPreset> {
@@ -538,14 +522,6 @@ pub fn cmd_init(config_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_numeric_id_rejects_non_digits() {
-        assert!(parse_numeric_id("abc").is_err());
-        assert!(parse_numeric_id("123a").is_err());
-        assert!(parse_numeric_id("").is_err());
-        assert_eq!(parse_numeric_id("123").unwrap(), "123");
-    }
 
     #[test]
     fn generate_config_sets_cwd_flag() {

@@ -22,7 +22,7 @@ large_text  = "devsignal"   # Hover tooltip for the idle large image.
 # ── Agent rules ────────────────────────────────────────────────────────────────
 # process_names: case-insensitive match against the sysinfo process name OR
 #                the basename of argv[0] (catches wrapped CLIs like "node .../codex").
-# argv_substrings: narrow matches when non-empty — all must appear in the command line.
+# argv_substrings: narrow matches when non-empty — at least one must appear in the command line.
 # priority: lower number wins when multiple agents match; ties break on lower PID.
 # buttons: up to 2 clickable buttons in the Discord presence panel.
 
