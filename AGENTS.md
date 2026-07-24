@@ -11,5 +11,6 @@
 - `Cargo.lock` is committed for reproducible CI and local dependency resolution.
 - `packaging/macos/install.sh` defaults `DEVSIGNAL_GITHUB_REPO` to rabbive/devsignal; set the variable to use a fork.
 - `scripts/setup-local-config.sh` copies `config.example.toml` to `~/.config/devsignal/config.toml` when missing; Discord desktop (not browser-only) is required for Rich Presence IPC.
-- Release v0.2.0 includes a universal macOS tarball; a Homebrew formula template lives under `packaging/homebrew/`.
+- Releases publish a universal macOS tarball plus `SHA256SUMS`; distribution is the tarball and
+  `packaging/macos/install.sh` only (the stale v0.2.0-pinned Homebrew formula was removed in 0.3.0).
 - `ci.yml` and `release.yml` set `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24` to reduce GitHub Actions Node 20 deprecation noise.

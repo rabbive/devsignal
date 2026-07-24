@@ -264,16 +264,26 @@ fn launch_agent_template() -> &'static str {
     include_str!("../../../packaging/macos/com.devsignal.daemon.example.plist")
 }
 
+/// Escape a path for interpolation into a plist `<string>`. A home or config path containing `&`
+/// or `<` would otherwise produce a malformed plist that `launchctl bootstrap` rejects with an
+/// opaque error.
+fn xml_escape(raw: &str) -> String {
+    raw.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 fn generate_launch_agent_plist(bin_path: &Path, config_path: &Path) -> Result<String> {
     let home = std::env::var("HOME").context("HOME is not set")?;
-    let mut plist = launch_agent_template()
-        .replace(
-            "/REPLACE/WITH/ABSOLUTE/PATH/TO/devsignal",
-            &bin_path.to_string_lossy(),
-        )
-        .replace("REPLACE_HOME", &home);
+    let bin = xml_escape(&bin_path.to_string_lossy());
+    let config = xml_escape(&config_path.to_string_lossy());
 
-    // Replace ProgramArguments array to include `--config <path>`.
+    let mut plist = launch_agent_template()
+        .replace("/REPLACE/WITH/ABSOLUTE/PATH/TO/devsignal", &bin)
+        .replace("REPLACE_HOME", &xml_escape(&home));
+
+    // Rewrite the ProgramArguments array to add `--config <path>`: launchd runs with a minimal
+    // environment, so the daemon must not rely on resolving the default path itself.
     let key = "<key>ProgramArguments</key>";
     let start = plist
         .find(key)
@@ -287,18 +297,13 @@ fn generate_launch_agent_plist(bin_path: &Path, config_path: &Path) -> Result<St
         .map(|i| array_open + i + "</array>".len())
         .context("ProgramArguments </array> not found")?;
 
-    let mut new_array = String::new();
-    new_array.push_str("<array>\n");
-    new_array.push_str(&format!(
-        "    <string>{}</string>\n",
-        bin_path.to_string_lossy()
-    ));
-    new_array.push_str("    <string>--config</string>\n");
-    new_array.push_str(&format!(
-        "    <string>{}</string>\n",
-        config_path.to_string_lossy()
-    ));
-    new_array.push_str("  </array>");
+    let new_array = format!(
+        "<array>\n    \
+         <string>{bin}</string>\n    \
+         <string>--config</string>\n    \
+         <string>{config}</string>\n  \
+         </array>"
+    );
 
     plist.replace_range(array_open..array_close, &new_array);
     Ok(plist)
@@ -588,6 +593,79 @@ mod tests {
         for other in [PrivacyPreset::Balanced, PrivacyPreset::Detailed] {
             assert!(privacy_preset_rules(other).is_empty());
         }
+    }
+
+    /// The template must stay well-formed XML. It previously contained `--` inside an XML comment
+    /// (from `cargo build --release`), which is illegal and rejected by any strict parser.
+    #[test]
+    fn launch_agent_template_has_no_double_hyphen_in_comments() {
+        let tpl = launch_agent_template();
+        let start = tpl.find("<!--").expect("template has a comment");
+        let end = tpl.find("-->").expect("comment is closed");
+        let body = &tpl[start + 4..end];
+        assert!(
+            !body.contains("--"),
+            "XML comments must not contain a double hyphen"
+        );
+    }
+
+    #[test]
+    fn generated_plist_contains_binary_and_config_paths() {
+        std::env::set_var("HOME", "/Users/demo");
+        let plist = generate_launch_agent_plist(
+            Path::new("/Users/demo/bin/devsignal"),
+            Path::new("/Users/demo/.config/devsignal/config.toml"),
+        )
+        .expect("generate");
+
+        assert!(plist.contains("<string>/Users/demo/bin/devsignal</string>"));
+        assert!(plist.contains("<string>--config</string>"));
+        assert!(
+            plist.contains("<string>/Users/demo/.config/devsignal/config.toml</string>"),
+            "config path must be passed explicitly"
+        );
+        // The placeholders must all be substituted.
+        assert!(!plist.contains("REPLACE_HOME"), "REPLACE_HOME left behind");
+        assert!(
+            !plist.contains("/REPLACE/WITH"),
+            "binary placeholder left behind"
+        );
+        assert!(plist.contains("/Users/demo/Library/Logs/devsignal/devsignal.out.log"));
+        // Exactly one array, and tags stay balanced after the surgery.
+        assert_eq!(plist.matches("<array>").count(), 1);
+        assert_eq!(plist.matches("</array>").count(), 1);
+        assert_eq!(plist.matches("<plist").count(), 1);
+        assert_eq!(plist.matches("</plist>").count(), 1);
+    }
+
+    #[test]
+    fn generated_plist_escapes_xml_significant_characters() {
+        std::env::set_var("HOME", "/Users/a&b");
+        let plist = generate_launch_agent_plist(
+            Path::new("/Users/a&b/bin/devsignal"),
+            Path::new("/Users/a&b/cfg<1>.toml"),
+        )
+        .expect("generate");
+
+        assert!(plist.contains("/Users/a&amp;b/bin/devsignal"));
+        assert!(plist.contains("cfg&lt;1&gt;.toml"));
+        // No bare ampersand may survive: every & must begin an entity.
+        for (idx, _) in plist.match_indices('&') {
+            let tail = &plist[idx..];
+            assert!(
+                tail.starts_with("&amp;") || tail.starts_with("&lt;") || tail.starts_with("&gt;"),
+                "bare & at byte {idx} would make the plist malformed"
+            );
+        }
+    }
+
+    #[test]
+    fn xml_escape_handles_each_significant_character() {
+        assert_eq!(xml_escape("a&b"), "a&amp;b");
+        assert_eq!(xml_escape("a<b>c"), "a&lt;b&gt;c");
+        assert_eq!(xml_escape("plain/path"), "plain/path");
+        // Ampersand is escaped first, so an escape is not double-escaped.
+        assert_eq!(xml_escape("&lt;"), "&amp;lt;");
     }
 
     /// The privacy fallback must not shadow a rule the user explicitly chose.

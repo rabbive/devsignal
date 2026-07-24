@@ -28,11 +28,11 @@ Leave **Discord desktop** open; the daemon talks to it over local IPC. If Discor
 
 ### Privacy presets
 
-`devsignal init` offers presets:
+`devsignal init` offers presets, each showing strictly more than the last:
 
-- **Minimal**: agent + frontmost host app only.
-- **Project-safe**: also shows the **project basename** (never full paths).
-- **Public/OSS**: polished defaults; no project names by default.
+- **Minimal**: agent only. Adds a catch-all rule that hides the host app.
+- **Balanced** (default): agent + frontmost host app.
+- **Detailed**: also shows the **project folder name** (basename only, never full paths).
 - **Custom**: choose per-option.
 
 ### Manual setup (fallback)
@@ -49,7 +49,10 @@ If you prefer not to use the wizard:
 | `devsignal` / `devsignal run` | Long-running daemon (default config path unless `--config`) |
 | `devsignal init [--config path]` | Interactive onboarding wizard: writes config, validates, optional local install + LaunchAgent |
 | `devsignal validate --config ~/.config/devsignal/config.toml` | Load and validate config; print agent rules |
-| `devsignal once --config …` | One sample: print JSON `PresenceView` (no Discord IPC) for debugging matchers |
+| `devsignal once --config …` | One sample: print the JSON `PresenceView` that `run` would publish (no Discord IPC) |
+| `devsignal detect --config …` | Show every process matching an agent rule, which one wins, and why |
+| `devsignal --version` | Print the version |
+| `devsignal --help` | Usage, including all `rules add` flags |
 | `devsignal hosts list/enable/disable` | View or change host app visibility by bundle id |
 | `devsignal agents list/enable/disable` | View or change detected AI agent CLIs by agent id |
 | `devsignal rules list/add/remove` | Manage first-match presence rules for custom state / hidden host |
@@ -66,20 +69,35 @@ Extract the tarball and place `devsignal` on your `PATH` (for example `~/bin/dev
 
 ### Installer script
 
-From a clone of this repo:
+Standalone, no clone required:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rabbive/devsignal/main/packaging/macos/install.sh | bash
+```
+
+Or from a clone, optionally pinning a version:
 
 ```bash
 # Optional: override repo (default is rabbive/devsignal)
 # export DEVSIGNAL_GITHUB_REPO="yourfork/devsignal"
-chmod +x packaging/macos/install.sh
-./packaging/macos/install.sh
+./packaging/macos/install.sh 0.3.0
 ```
 
-This downloads the latest GitHub Release, installs to `~/bin/devsignal`, scaffolds `~/.config/devsignal/config.toml` from `config.example.toml` if missing, and optionally loads the LaunchAgent plist.
+It downloads the release tarball, **verifies it against the published `SHA256SUMS`**, installs to
+`~/bin/devsignal`, clears the Gatekeeper quarantine attribute, scaffolds
+`~/.config/devsignal/config.toml` if missing, and — when run interactively — offers to load the
+LaunchAgent. Under `curl | bash` there is no TTY, so it points you at `devsignal init` instead.
 
-### Homebrew (tap)
+### Gatekeeper and code signing
 
-Use [`packaging/homebrew/devsignal.rb`](packaging/homebrew/devsignal.rb) as a template in your own tap: after the matching GitHub Release exists, set `sha256` via `shasum -a 256` on the downloaded `devsignal-<version>-macos-universal.tar.gz` (see comments in the formula).
+Release binaries are signed and notarized when the maintainer's Apple credentials are configured in
+CI; the workflow falls back to publishing an **unsigned** binary otherwise, and says so in the run
+log. macOS quarantines anything downloaded either way, so if you install by hand rather than with
+`install.sh`, clear the attribute:
+
+```bash
+xattr -d com.apple.quarantine ~/bin/devsignal
+```
 
 ### macOS permissions
 
@@ -91,7 +109,7 @@ Host detection prefers **AppKit** (`NSWorkspace` / `NSRunningApplication`). If t
 - `min_push_interval_secs`: minimum time between Discord presence updates unless the active agent changes (reduces flicker and rate limits).
 - `idle_mode`: `status` (default) shows an idle line when no agent is detected; `clear` calls Discord **CLEAR_ACTIVITY** so nothing is shown for this application.
 - `show_cwd_basename`: when `true`, appends the **basename only** of the winning agent process working directory (never full paths). Off by default for privacy.
-- `[[agents]]`: `process_names` match **case-insensitively** against the `sysinfo` process name **or** the **basename of argv0** (so wrapped CLIs like `node …/codex` can match `codex`). Optional `argv_substrings` narrow matches when non-empty (**case-insensitive** substring match on the full command line).
+- `[[agents]]`: `process_names` match **case-insensitively** against the `sysinfo` process name **or** the **basename of argv0** (so wrapped CLIs like `node …/codex` can match `codex`). Optional `argv_substrings` narrow matches when non-empty — **at least one** must appear in the command line (case-insensitive).
 - `priority`: **lower number wins** when multiple agents match.
 - `[platforms]`: `disabled_hosts` hides selected host app bundle ids; `disabled_agents` ignores selected agent ids. All known hosts/agents are enabled by default.
 - `[[rules]]`: first-match presence rules. Conditions can match host bundle ids, agent ids, active/idle state, project basename, and local time windows. Actions can hide the host and/or override the state line.
