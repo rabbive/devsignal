@@ -1,19 +1,23 @@
 use anyhow::{Context, Result};
 use chrono::Timelike;
 use devsignal_core::{
-    agent_allowed, apply_rules, build_presence_view, host_allowed, process_matches_rule,
-    redact_cwd_basename, select_active_agent, Config, Debouncer, IdleMode, PresenceView,
-    RuleContext,
+    agent_allowed, apply_rules, build_presence_view, host_allowed, host_label_for_bundle,
+    process_matches_rule, redact_cwd_basename, select_active_agent, ActiveAgent, AgentRule, Config,
+    Debouncer, IdleMode, PresenceView, RuleContext,
 };
 use devsignal_discord::{clear_presence_resilient, set_presence_resilient, PresenceSession};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
-use tracing::{info, warn};
+use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System, UpdateKind};
+use tracing::{debug, info, warn};
 
+mod cli;
 mod config_edit;
+mod config_io;
 mod init;
+
+use cli::{Cli, RunArgs};
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
@@ -40,158 +44,71 @@ fn hidden_host_state(active: bool, cwd_basename: Option<&str>) -> String {
     }
 }
 
-#[derive(Debug)]
-enum Cli {
-    Run(RunArgs),
-    Validate { config: PathBuf },
-    Once { config: PathBuf },
-    Init { config: PathBuf },
-    ConfigEdit(config_edit::ConfigEditCommand),
-}
-
-#[derive(Debug)]
-struct RunArgs {
-    config: PathBuf,
-    /// When true, retry Discord IPC until timeout if Discord is not running.
-    wait_for_discord: bool,
-}
-
-fn print_global_help() {
-    eprintln!(
-        "devsignal — unified Discord Rich Presence for AI coding CLIs (macOS)\n\
-         \n\
-         Usage:\n\
-           devsignal [run] [options]\n\
-           devsignal init [--config path]\n\
-           devsignal validate [--config path]\n\
-           devsignal once [--config path]\n\
-           devsignal hosts list|enable|disable ...\n\
-           devsignal agents list|enable|disable ...\n\
-           devsignal rules list|add|remove ...\n\
-         \n\
-         Default config: {}\n\
-         \n\
-         Run options:\n\
-           -c, --config <path>     Config file (default: see above)\n\
-           --wait-for-discord      Retry until Discord is available (default)\n\
-           --no-wait-for-discord   Fail immediately if Discord IPC is unavailable\n",
-        Config::default_path().display()
-    );
-}
-
-fn parse_config_path_only(args: &[String]) -> Result<PathBuf> {
-    let mut path = Config::default_path();
-    let mut it = args.iter().peekable();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--config" | "-c" => {
-                let p = it.next().context("--config requires a path")?;
-                path = PathBuf::from(p);
-            }
-            "--help" | "-h" => {
-                print_global_help();
-                std::process::exit(0);
-            }
-            other => anyhow::bail!("unknown argument: {other}"),
-        }
-    }
-    Ok(path)
-}
-
-fn parse_run_args(args: &[String]) -> Result<RunArgs> {
-    let mut path = Config::default_path();
-    let mut wait_for_discord = true;
-    let mut it = args.iter().peekable();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--config" | "-c" => {
-                let p = it.next().context("--config requires a path")?;
-                path = PathBuf::from(p);
-            }
-            "--wait-for-discord" => wait_for_discord = true,
-            "--no-wait-for-discord" => wait_for_discord = false,
-            "--help" | "-h" => {
-                print_global_help();
-                std::process::exit(0);
-            }
-            other => anyhow::bail!("unknown argument: {other}"),
-        }
-    }
-    Ok(RunArgs {
-        config: path,
-        wait_for_discord,
-    })
-}
-
-fn parse_cli() -> Result<Cli> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() {
-        return Ok(Cli::Run(RunArgs {
-            config: Config::default_path(),
-            wait_for_discord: true,
-        }));
-    }
-    match args[0].as_str() {
-        "init" => {
-            let rest = &args[1..];
-            Ok(Cli::Init {
-                config: parse_config_path_only(rest)?,
-            })
-        }
-        "validate" => {
-            let rest = &args[1..];
-            Ok(Cli::Validate {
-                config: parse_config_path_only(rest)?,
-            })
-        }
-        "once" => {
-            let rest = &args[1..];
-            Ok(Cli::Once {
-                config: parse_config_path_only(rest)?,
-            })
-        }
-        "run" => {
-            let rest = &args[1..];
-            Ok(Cli::Run(parse_run_args(rest)?))
-        }
-        "hosts" => {
-            let rest = &args[1..];
-            Ok(Cli::ConfigEdit(config_edit::parse_hosts_command(rest)?))
-        }
-        "agents" => {
-            let rest = &args[1..];
-            Ok(Cli::ConfigEdit(config_edit::parse_agents_command(rest)?))
-        }
-        "rules" => {
-            let rest = &args[1..];
-            Ok(Cli::ConfigEdit(config_edit::parse_rules_command(rest)?))
-        }
-        "help" | "--help" | "-h" => {
-            print_global_help();
-            std::process::exit(0);
-        }
-        // Legacy: `devsignal --config foo` without subcommand
-        _ => Ok(Cli::Run(parse_run_args(&args)?)),
+/// Only the process fields devsignal actually reads. `nothing()` still yields pid, parent, name,
+/// and start time, so this covers `proc.name()`; `cmd` is needed for argv matching, and `cwd` only
+/// when the config asks for the project basename. Notably this stops refreshing `environ` for every
+/// process on the machine every poll — the most expensive and most privacy-sensitive field.
+fn process_refresh_kind(need_cwd: bool) -> ProcessRefreshKind {
+    let kind = ProcessRefreshKind::nothing().with_cmd(UpdateKind::OnlyIfNotSet);
+    if need_cwd {
+        kind.with_cwd(UpdateKind::OnlyIfNotSet)
+    } else {
+        kind
     }
 }
 
-fn collect_matches(sys: &System, cfg: &Config) -> Vec<(devsignal_core::AgentRule, u32)> {
+fn refresh_processes(sys: &mut System, need_cwd: bool) {
+    sys.refresh_specifics(RefreshKind::nothing().with_processes(process_refresh_kind(need_cwd)));
+}
+
+/// One process that satisfied one agent rule.
+struct Candidate {
+    rule: AgentRule,
+    pid: u32,
+    process_name: String,
+    argv0: Option<String>,
+}
+
+fn collect_matches(sys: &System, cfg: &Config) -> Vec<Candidate> {
     let mut out = Vec::new();
     for (pid, proc) in sys.processes() {
+        // On Linux, sysinfo enumerates threads alongside processes, and every thread of an agent CLI
+        // inherits its argv[0] — so one running CLI would otherwise match a dozen times. Always
+        // `None` on macOS, where threads are not listed, so this is a no-op there.
+        if proc.thread_kind().is_some() {
+            continue;
+        }
         let name = proc.name().to_string_lossy();
         let cmd = proc.cmd();
         for rule in &cfg.agents {
             if agent_allowed(cfg, Some(&rule.id)) && process_matches_rule(&name, cmd, rule) {
-                out.push((rule.clone(), pid.as_u32()));
+                out.push(Candidate {
+                    rule: rule.clone(),
+                    pid: pid.as_u32(),
+                    process_name: name.to_string(),
+                    argv0: cmd
+                        .first()
+                        .map(|a| a.to_string_lossy().to_string())
+                        .filter(|s| !s.is_empty()),
+                });
             }
         }
     }
     out
 }
 
+fn winner_of(candidates: &[Candidate]) -> Option<(ActiveAgent, u32)> {
+    select_active_agent(
+        candidates
+            .iter()
+            .map(|c| (c.rule.clone(), c.pid))
+            .collect::<Vec<_>>(),
+    )
+}
+
 fn build_policy_view(
     cfg: &Config,
-    agent: Option<&devsignal_core::ActiveAgent>,
+    agent: Option<&ActiveAgent>,
     host_bundle_id: Option<&str>,
     session_start_unix: Option<u64>,
     cwd_basename: Option<&str>,
@@ -219,6 +136,16 @@ fn build_policy_view(
     view
 }
 
+/// Resolve the project basename for the winning PID, when the config asks for it.
+fn cwd_basename_for(sys: &System, cfg: &Config, pid: Option<u32>) -> Option<String> {
+    if !cfg.show_cwd_basename {
+        return None;
+    }
+    sys.process(Pid::from_u32(pid?))
+        .and_then(|p| p.cwd())
+        .and_then(redact_cwd_basename)
+}
+
 fn connect_with_wait(session: &mut PresenceSession, wait: bool) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut sleep_dur = Duration::from_millis(400);
@@ -237,43 +164,172 @@ fn connect_with_wait(session: &mut PresenceSession, wait: bool) -> Result<()> {
     }
 }
 
-fn cmd_validate(config_path: &Path) -> Result<()> {
-    if !config_path.exists() {
-        anyhow::bail!("config not found at {}", config_path.display());
+fn missing_config_error(path: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "config not found at {}\n\
+         Run `devsignal init` for a guided setup, or copy config.example.toml to that path \
+         and set discord.client_id.",
+        path.display()
+    )
+}
+
+fn load_config(path: &Path) -> Result<Config> {
+    if !path.exists() {
+        return Err(missing_config_error(path));
     }
-    let cfg = Config::load_from_path(config_path).context("load config")?;
+    Config::load_from_path(path).context("load config")
+}
+
+fn cmd_validate(config_path: &Path) -> Result<()> {
+    let cfg = load_config(config_path)?;
     println!("OK: {}", config_path.display());
     println!("discord.client_id: {}", cfg.discord.client_id);
+    println!(
+        "idle_mode: {:?}  show_cwd_basename: {}  poll: {}s  min_push: {}s",
+        cfg.idle_mode, cfg.show_cwd_basename, cfg.poll_interval_secs, cfg.min_push_interval_secs
+    );
+
     for a in &cfg.agents {
+        let enabled = agent_allowed(&cfg, Some(&a.id));
         println!(
-            "  [[agents]] id={} label={:?} priority={} process_names={:?} argv_substrings={:?}",
-            a.id, a.label, a.priority, a.process_names, a.argv_substrings
+            "  [[agents]] id={} label={:?} priority={} {}",
+            a.id,
+            a.label,
+            a.priority,
+            if enabled { "" } else { "(disabled)" }
+        );
+        println!(
+            "             process_names={:?} argv_substrings={:?}",
+            a.process_names, a.argv_substrings
+        );
+        println!(
+            "             large_image={:?} small_image={:?} small_text={:?}",
+            a.large_image, a.small_image, a.small_text
+        );
+        for b in &a.buttons {
+            println!("             button: {:?} -> {}", b.label, b.url);
+        }
+    }
+
+    if !cfg.platforms.disabled_hosts.is_empty() {
+        println!("  disabled_hosts: {:?}", cfg.platforms.disabled_hosts);
+    }
+    if !cfg.platforms.disabled_agents.is_empty() {
+        println!("  disabled_agents: {:?}", cfg.platforms.disabled_agents);
+    }
+    for r in &cfg.rules {
+        println!(
+            "  [[rules]] name={} hide_host={} state={:?}",
+            r.name, r.then.hide_host, r.then.state
         );
     }
     Ok(())
 }
 
 fn cmd_once(config_path: &Path) -> Result<()> {
-    if !config_path.exists() {
-        anyhow::bail!("config not found at {}", config_path.display());
-    }
-    let cfg = Config::load_from_path(config_path).context("load config")?;
+    let cfg = load_config(config_path)?;
     let mut sys = System::new();
-    sys.refresh_specifics(RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()));
-    let matches = collect_matches(&sys, &cfg);
-    let selected = select_active_agent(matches);
+    refresh_processes(&mut sys, cfg.show_cwd_basename);
+    let candidates = collect_matches(&sys, &cfg);
+    let selected = winner_of(&candidates);
     let bundle = devsignal_macos::frontmost_bundle_id();
+    // Resolve the CWD exactly as `run` does, so a rule using `when.project_basenames` behaves the
+    // same here as in the daemon.
+    let cwd = cwd_basename_for(&sys, &cfg, selected.as_ref().map(|(_, pid)| *pid));
     let view = build_policy_view(
         &cfg,
         selected.as_ref().map(|(a, _)| a),
         bundle.as_deref(),
         None,
-        None,
+        cwd.as_deref(),
         Some(local_minutes_now()),
     );
     println!(
         "{}",
         serde_json::to_string_pretty(&view).context("serialize presence view")?
+    );
+    Ok(())
+}
+
+/// Show every process that matched an agent rule, plus which one wins. This is the tool for
+/// answering "why isn't my agent detected?" — `agents list` only shows *configured* agents.
+fn cmd_detect(config_path: &Path) -> Result<()> {
+    let cfg = load_config(config_path)?;
+    let mut sys = System::new();
+    refresh_processes(&mut sys, cfg.show_cwd_basename);
+
+    let bundle = devsignal_macos::frontmost_bundle_id();
+    match &bundle {
+        Some(id) => println!("frontmost host: {} ({})", id, host_label_for_bundle(id)),
+        None => println!("frontmost host: <unknown>"),
+    }
+    if !host_allowed(&cfg, bundle.as_deref()) {
+        println!("  note: this host is in platforms.disabled_hosts, so it will be hidden");
+    }
+
+    let mut candidates = collect_matches(&sys, &cfg);
+    candidates.sort_by(|a, b| {
+        a.rule
+            .priority
+            .cmp(&b.rule.priority)
+            .then_with(|| a.pid.cmp(&b.pid))
+    });
+
+    if candidates.is_empty() {
+        println!("\nno agent processes matched. Rules searched:");
+        for a in &cfg.agents {
+            if agent_allowed(&cfg, Some(&a.id)) {
+                println!(
+                    "  {} — process_names={:?} argv_substrings={:?}",
+                    a.id, a.process_names, a.argv_substrings
+                );
+            } else {
+                println!("  {} — (disabled via platforms.disabled_agents)", a.id);
+            }
+        }
+        println!(
+            "\nCompare against `ps -eo comm,args`. A rule matches on the process name OR the\n\
+             basename of argv[0], case-insensitively."
+        );
+        return Ok(());
+    }
+
+    println!("\n{} matching process(es):", candidates.len());
+    for c in &candidates {
+        println!(
+            "  {:<14} pid={:<7} priority={:<5} name={:<18} argv0={}",
+            c.rule.id,
+            c.pid,
+            c.rule.priority,
+            c.process_name,
+            c.argv0.as_deref().unwrap_or("<none>")
+        );
+    }
+
+    if let Some((agent, pid)) = winner_of(&candidates) {
+        println!(
+            "\nwinner: {} (pid {}) — lowest priority wins, ties break on lowest pid",
+            agent.id, pid
+        );
+        let cwd = cwd_basename_for(&sys, &cfg, Some(pid));
+        let view = build_policy_view(
+            &cfg,
+            Some(&agent),
+            bundle.as_deref(),
+            None,
+            cwd.as_deref(),
+            Some(local_minutes_now()),
+        );
+        println!("  details: {}", view.details);
+        println!("  state:   {}", view.state);
+    }
+    Ok(())
+}
+
+fn require_macos(what: &str) -> Result<()> {
+    anyhow::ensure!(
+        cfg!(target_os = "macos"),
+        "`devsignal {what}` requires macOS (host detection uses AppKit and autostart uses launchd)"
     );
     Ok(())
 }
@@ -286,78 +342,49 @@ fn main() {
         )
         .init();
 
-    #[cfg(not(target_os = "macos"))]
-    {
-        eprintln!("devsignal currently supports macOS only");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cli = match cli::parse_cli(&args) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e:#}");
+            std::process::exit(2);
+        }
+    };
+
+    let result = match cli {
+        // Explicitly requested help/version go to stdout so they can be piped.
+        Cli::Help => {
+            print!("{}", cli::global_help());
+            Ok(())
+        }
+        Cli::Version => {
+            println!("{}", cli::version_line());
+            Ok(())
+        }
+        Cli::Validate { config } => cmd_validate(&config),
+        Cli::Once { config } => cmd_once(&config),
+        Cli::Detect { config } => cmd_detect(&config),
+        Cli::ConfigEdit(cmd) => config_edit::run_config_edit(cmd),
+        Cli::Init { config } => require_macos("init").and_then(|()| init::cmd_init(&config)),
+        Cli::Run(args) => require_macos("run").and_then(|()| run_daemon(args)),
+    };
+
+    if let Err(e) = result {
+        eprintln!("{e:#}");
         std::process::exit(1);
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let cli = match parse_cli() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("{e:#}");
-                std::process::exit(2);
-            }
-        };
-
-        let code = match cli {
-            Cli::Init { config } => match init::cmd_init(&config) {
-                Ok(()) => 0,
-                Err(e) => {
-                    eprintln!("{e:#}");
-                    1
-                }
-            },
-            Cli::Validate { config } => match cmd_validate(&config) {
-                Ok(()) => 0,
-                Err(e) => {
-                    eprintln!("{e:#}");
-                    1
-                }
-            },
-            Cli::Once { config } => match cmd_once(&config) {
-                Ok(()) => 0,
-                Err(e) => {
-                    eprintln!("{e:#}");
-                    1
-                }
-            },
-            Cli::Run(args) => match run_daemon(args) {
-                Ok(()) => 0,
-                Err(e) => {
-                    eprintln!("{e:#}");
-                    1
-                }
-            },
-            Cli::ConfigEdit(cmd) => match config_edit::run_config_edit(cmd) {
-                Ok(()) => 0,
-                Err(e) => {
-                    eprintln!("{e:#}");
-                    1
-                }
-            },
-        };
-        std::process::exit(code);
     }
 }
 
-#[cfg(target_os = "macos")]
 fn run_daemon(args: RunArgs) -> Result<()> {
-    let _ = ctrlc::set_handler(|| {
+    if let Err(e) = ctrlc::set_handler(|| {
         RUNNING.store(false, Ordering::SeqCst);
-    });
-
-    if !args.config.exists() {
-        anyhow::bail!(
-            "config not found at {}\n\
-             Copy config.example.toml to that path and set discord.client_id.",
-            args.config.display()
-        );
+    }) {
+        // Without a handler we would never clear presence on shutdown, leaving a stale activity
+        // in Discord. Surface it rather than swallowing it.
+        warn!(error = %e, "could not install signal handler; presence may not clear on exit");
     }
 
-    let cfg = Config::load_from_path(&args.config).context("load config")?;
+    let cfg = load_config(&args.config)?;
     let poll = Duration::from_secs(cfg.poll_interval_secs.max(1));
     let debounce_min = Duration::from_secs(cfg.min_push_interval_secs.max(1));
 
@@ -367,7 +394,7 @@ fn run_daemon(args: RunArgs) -> Result<()> {
     let sys = System::new();
     let debouncer = Debouncer::new(debounce_min);
 
-    info!(config = %args.config.display(), "devsignal running");
+    info!(config = %args.config.display(), version = env!("CARGO_PKG_VERSION"), "devsignal running");
 
     let state = RunState {
         cfg,
@@ -383,7 +410,6 @@ fn run_daemon(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 struct RunState {
     cfg: Config,
     session: PresenceSession,
@@ -395,18 +421,18 @@ struct RunState {
     first_tick: bool,
 }
 
-#[cfg(target_os = "macos")]
 fn run_forever(mut state: RunState) {
     while RUNNING.load(Ordering::SeqCst) {
-        state.sys.refresh_specifics(
-            RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
-        );
+        refresh_processes(&mut state.sys, state.cfg.show_cwd_basename);
 
-        let matches = collect_matches(&state.sys, &state.cfg);
-        let selected = select_active_agent(matches);
+        let candidates = collect_matches(&state.sys, &state.cfg);
+        let selected = winner_of(&candidates);
 
         let agent_id = selected.as_ref().map(|(a, _)| a.id.clone());
         let transition = agent_id != state.last_agent_id;
+        if transition {
+            debug!(?agent_id, candidates = candidates.len(), "agent transition");
+        }
 
         let entered_idle_clear = selected.is_none() && state.cfg.idle_mode == IdleMode::Clear;
 
@@ -428,17 +454,11 @@ fn run_forever(mut state: RunState) {
             state.last_agent_id = agent_id;
         }
 
-        let cwd_hint = if state.cfg.show_cwd_basename {
-            selected.as_ref().and_then(|(_, pid)| {
-                state
-                    .sys
-                    .process(Pid::from_u32(*pid))
-                    .and_then(|p| p.cwd())
-                    .and_then(redact_cwd_basename)
-            })
-        } else {
-            None
-        };
+        let cwd_hint = cwd_basename_for(
+            &state.sys,
+            &state.cfg,
+            selected.as_ref().map(|(_, pid)| *pid),
+        );
 
         let bundle = devsignal_macos::frontmost_bundle_id();
 
@@ -453,6 +473,7 @@ fn run_forever(mut state: RunState) {
 
         let force = transition || state.first_tick;
         if state.debouncer.should_push(&view, force) {
+            debug!(details = %view.details, state = %view.state, "pushing presence");
             set_presence_resilient(&mut state.session, &view);
         }
 
@@ -461,4 +482,40 @@ fn run_forever(mut state: RunState) {
     }
 
     clear_presence_resilient(&mut state.session);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hidden_host_state_covers_active_idle_and_project() {
+        assert_eq!(hidden_host_state(true, None), "Working");
+        assert_eq!(hidden_host_state(true, Some("myrepo")), "Working · myrepo");
+        assert_eq!(hidden_host_state(true, Some("")), "Working");
+        assert_eq!(hidden_host_state(false, Some("x")), "No agent CLI detected");
+    }
+
+    #[test]
+    fn process_refresh_kind_only_asks_for_what_we_read() {
+        let lean = process_refresh_kind(false);
+        assert_eq!(lean.cwd(), UpdateKind::Never);
+        assert_eq!(lean.cmd(), UpdateKind::OnlyIfNotSet);
+        // The expensive/sensitive fields must stay off.
+        assert_eq!(lean.environ(), UpdateKind::Never);
+        assert!(!lean.cpu());
+        assert!(!lean.memory());
+        assert!(!lean.disk_usage());
+
+        let with_cwd = process_refresh_kind(true);
+        assert_eq!(with_cwd.cwd(), UpdateKind::OnlyIfNotSet);
+        assert_eq!(with_cwd.environ(), UpdateKind::Never);
+    }
+
+    #[test]
+    fn missing_config_error_points_at_init() {
+        let msg = format!("{}", missing_config_error(Path::new("/nope/x.toml")));
+        assert!(msg.contains("/nope/x.toml"), "got {msg}");
+        assert!(msg.contains("devsignal init"), "got {msg}");
+    }
 }

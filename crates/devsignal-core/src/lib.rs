@@ -97,6 +97,13 @@ pub struct AgentRule {
     pub buttons: Vec<ButtonConfig>,
 }
 
+/// Discord's documented limits for the activity fields devsignal populates. Exceeding any of them
+/// makes Discord reject the whole payload, which surfaces only as a `warn!` — so these are enforced
+/// at config-load time instead.
+pub const BUTTON_LABEL_MAX_CHARS: usize = 32;
+pub const BUTTON_URL_MAX_CHARS: usize = 512;
+pub const MAX_BUTTONS: usize = 2;
+
 /// A Discord Rich Presence button (label + URL). Maximum 2 per presence payload.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ButtonConfig {
@@ -104,6 +111,56 @@ pub struct ButtonConfig {
     pub label: String,
     /// URL opened when the button is clicked (1–512 characters).
     pub url: String,
+}
+
+impl ButtonConfig {
+    pub fn validate(&self) -> Result<()> {
+        let label = self.label.trim();
+        anyhow::ensure!(!label.is_empty(), "button label must not be empty");
+        // Discord counts characters, not bytes.
+        let label_len = self.label.chars().count();
+        anyhow::ensure!(
+            label_len <= BUTTON_LABEL_MAX_CHARS,
+            "button label {:?} is {} characters; Discord allows at most {}",
+            self.label,
+            label_len,
+            BUTTON_LABEL_MAX_CHARS
+        );
+
+        anyhow::ensure!(
+            !self.url.trim().is_empty(),
+            "button {:?} must have a url",
+            self.label
+        );
+        let url_len = self.url.chars().count();
+        anyhow::ensure!(
+            url_len <= BUTTON_URL_MAX_CHARS,
+            "button {:?} url is {} characters; Discord allows at most {}",
+            self.label,
+            url_len,
+            BUTTON_URL_MAX_CHARS
+        );
+        anyhow::ensure!(
+            self.url.starts_with("http://") || self.url.starts_with("https://"),
+            "button {:?} url must start with http:// or https:// (got {:?})",
+            self.label,
+            self.url
+        );
+        Ok(())
+    }
+}
+
+/// A Discord Application ID is an opaque numeric snowflake. Rejecting non-numeric values at
+/// config-load time avoids a misleading "is Discord running?" failure at IPC connect.
+pub fn parse_numeric_id(raw: &str) -> Result<String> {
+    let s = raw.trim();
+    anyhow::ensure!(!s.is_empty(), "Discord Application ID cannot be empty");
+    anyhow::ensure!(
+        s.chars().all(|c| c.is_ascii_digit()),
+        "Discord Application ID must be numeric (got {s:?}); \
+         copy it from https://discord.com/developers/applications"
+    );
+    Ok(s.to_string())
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -173,6 +230,118 @@ fn default_priority() -> i32 {
     100
 }
 
+/// Built-in agent CLI presets — the single source of truth for `devsignal init` and the shipped
+/// `config.example.toml`. Both used to hardcode their own copy, which drifts.
+///
+/// `process_names` matches the process name **or** the basename of `argv[0]`, case-insensitively,
+/// so Node- and Python-wrapped CLIs are covered without extra entries.
+///
+/// Two caveats worth knowing before trusting a preset:
+///
+/// * **Binary names are best-effort.** These CLIs rename and re-package often. Run
+///   `devsignal detect` while the CLI is running to confirm what your machine actually reports,
+///   and adjust `process_names` in your own config if a preset misses.
+/// * **Some names are generic enough to collide** with unrelated tools (`goose` is also a Go
+///   database-migration tool; `amp` and `crush` are short). A false positive only mislabels the
+///   presence line; `devsignal agents disable <id>` turns any preset off.
+///
+/// `large_image` is a Discord art-asset **key**, not a URL — a key you have not uploaded in the
+/// Developer Portal renders blank. `devsignal init` prints the full list of keys to upload.
+/// Priorities are spaced by 10 so you can slot custom rules between presets.
+pub fn agent_presets() -> Vec<AgentRule> {
+    fn preset(
+        id: &str,
+        label: &str,
+        process_names: &[&str],
+        priority: i32,
+        button: Option<(&str, &str)>,
+    ) -> AgentRule {
+        AgentRule {
+            id: id.to_string(),
+            label: Some(label.to_string()),
+            process_names: process_names.iter().map(|s| s.to_string()).collect(),
+            argv_substrings: vec![],
+            large_image: Some(id.to_string()),
+            priority,
+            small_image: Some("devsignal".to_string()),
+            small_text: Some("devsignal".to_string()),
+            buttons: button
+                .map(|(label, url)| {
+                    vec![ButtonConfig {
+                        label: label.to_string(),
+                        url: url.to_string(),
+                    }]
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    vec![
+        preset(
+            "claude_code",
+            "Claude Code",
+            &["claude", "claude-code"],
+            10,
+            Some(("Claude Code Docs", "https://claude.ai/code")),
+        ),
+        preset(
+            "codex",
+            "Codex",
+            &["codex"],
+            20,
+            Some(("Codex on GitHub", "https://github.com/openai/codex")),
+        ),
+        preset(
+            "gemini_cli",
+            "Gemini CLI",
+            &["gemini"],
+            30,
+            Some(("Gemini CLI", "https://github.com/google-gemini/gemini-cli")),
+        ),
+        preset(
+            "opencode",
+            "OpenCode",
+            &["opencode"],
+            40,
+            Some(("OpenCode Docs", "https://opencode.ai")),
+        ),
+        preset("amp", "Amp", &["amp"], 50, None),
+        preset("cursor_agent", "Cursor Agent", &["cursor-agent"], 60, None),
+        preset("copilot_cli", "Copilot CLI", &["copilot"], 70, None),
+        preset(
+            "aider",
+            "Aider",
+            &["aider"],
+            80,
+            Some(("Aider Docs", "https://aider.chat")),
+        ),
+        preset(
+            "crush",
+            "Crush",
+            &["crush"],
+            90,
+            Some(("Crush on GitHub", "https://github.com/charmbracelet/crush")),
+        ),
+        preset("qwen_code", "Qwen Code", &["qwen"], 100, None),
+        preset("droid", "Droid", &["droid"], 110, None),
+        preset("cline", "Cline", &["cline"], 120, None),
+        preset("goose", "Goose", &["goose"], 130, None),
+    ]
+}
+
+/// Every distinct Discord art-asset key the presets reference, for the `init` wizard's upload list.
+pub fn preset_asset_keys() -> Vec<String> {
+    let mut keys = vec!["devsignal".to_string()];
+    for agent in agent_presets() {
+        if let Some(key) = agent.large_image {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
 impl Config {
     pub fn load_from_path(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
@@ -197,14 +366,109 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        anyhow::ensure!(
-            !self.discord.client_id.trim().is_empty(),
-            "discord.client_id must be set"
-        );
+        parse_numeric_id(&self.discord.client_id).context("discord.client_id")?;
         anyhow::ensure!(
             !self.agents.is_empty(),
             "at least one [[agents]] entry is required"
         );
+
+        let mut seen_ids: Vec<&str> = Vec::new();
+        for agent in &self.agents {
+            agent
+                .validate()
+                .with_context(|| format!("[[agents]] id={}", agent.id))?;
+            anyhow::ensure!(
+                !seen_ids.contains(&agent.id.as_str()),
+                "duplicate [[agents]] id: {}",
+                agent.id
+            );
+            seen_ids.push(&agent.id);
+        }
+
+        let mut seen_rules: Vec<&str> = Vec::new();
+        for rule in &self.rules {
+            rule.validate()
+                .with_context(|| format!("[[rules]] name={}", rule.name))?;
+            anyhow::ensure!(
+                !seen_rules.contains(&rule.name.as_str()),
+                "duplicate [[rules]] name: {}",
+                rule.name
+            );
+            seen_rules.push(&rule.name);
+        }
+        Ok(())
+    }
+}
+
+impl AgentRule {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(!self.id.trim().is_empty(), "agent id must not be empty");
+        // `process_matches_rule` requires a `process_names` hit before it even looks at
+        // `argv_substrings`, so an entry without one can never match anything.
+        anyhow::ensure!(
+            !self.process_names.is_empty(),
+            "agent {:?} has no process_names, so it can never match a process",
+            self.id
+        );
+        anyhow::ensure!(
+            self.buttons.len() <= MAX_BUTTONS,
+            "agent {:?} declares {} buttons; Discord shows at most {}. \
+             Remove the extras rather than relying on truncation.",
+            self.id,
+            self.buttons.len(),
+            MAX_BUTTONS
+        );
+        for button in &self.buttons {
+            button.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl TimeWindow {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            parse_hhmm_minutes(&self.start).is_some(),
+            "time window start {:?} is not HH:MM (24-hour)",
+            self.start
+        );
+        anyhow::ensure!(
+            parse_hhmm_minutes(&self.end).is_some(),
+            "time window end {:?} is not HH:MM (24-hour)",
+            self.end
+        );
+        Ok(())
+    }
+}
+
+impl PresenceRule {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(!self.name.trim().is_empty(), "rule name must not be empty");
+        // `apply_rules` returns on the first `when` match regardless of `then`, so a rule that
+        // changes nothing would silently shadow every rule after it.
+        anyhow::ensure!(
+            self.then.hide_host || self.then.state.is_some(),
+            "rule {:?} does nothing: set then.hide_host and/or then.state. \
+             An empty `then` still matches and would block every later rule.",
+            self.name
+        );
+        if let Some(state) = &self.then.state {
+            anyhow::ensure!(
+                !state.trim().is_empty(),
+                "rule {:?} has an empty then.state",
+                self.name
+            );
+        }
+        anyhow::ensure!(
+            !(self.when.active_only && self.when.idle_only),
+            "rule {:?} sets both active_only and idle_only, so it can never match",
+            self.name
+        );
+        if let Some(window) = &self.when.time {
+            window
+                .validate()
+                .with_context(|| format!("rule {:?}", self.name))?;
+        }
         Ok(())
     }
 }
@@ -549,6 +813,363 @@ mod tests {
             agents: vec![],
             platforms: PlatformsConfig::default(),
             rules: vec![],
+        }
+    }
+
+    /// A config that passes `validate()`, for tests that mutate one thing and expect a rejection.
+    fn valid_config() -> Config {
+        let mut cfg = sample_config();
+        cfg.agents = vec![AgentRule {
+            id: "claude_code".into(),
+            label: None,
+            process_names: vec!["claude".into()],
+            argv_substrings: vec![],
+            large_image: None,
+            priority: 10,
+            small_image: None,
+            small_text: None,
+            buttons: vec![],
+        }];
+        cfg
+    }
+
+    fn err_of(cfg: &Config) -> String {
+        format!(
+            "{:#}",
+            cfg.validate().expect_err("expected validation error")
+        )
+    }
+
+    #[test]
+    fn valid_config_passes_validation() {
+        valid_config().validate().expect("should be valid");
+    }
+
+    #[test]
+    fn parse_numeric_id_rejects_non_digits() {
+        assert!(parse_numeric_id("abc").is_err());
+        assert!(parse_numeric_id("123a").is_err());
+        assert!(parse_numeric_id("").is_err());
+        assert_eq!(parse_numeric_id("123").unwrap(), "123");
+        assert_eq!(parse_numeric_id("  123  ").unwrap(), "123");
+    }
+
+    #[test]
+    fn validate_rejects_non_numeric_client_id() {
+        let mut cfg = valid_config();
+        // The value config.example.toml ships with, so this is the first thing a new user hits.
+        cfg.discord.client_id = "YOUR_DISCORD_APPLICATION_ID".into();
+        let msg = err_of(&cfg);
+        assert!(msg.contains("client_id"), "got {msg}");
+        assert!(msg.contains("numeric"), "got {msg}");
+    }
+
+    #[test]
+    fn validate_requires_at_least_one_agent() {
+        let mut cfg = valid_config();
+        cfg.agents.clear();
+        assert!(err_of(&cfg).contains("[[agents]]"));
+    }
+
+    #[test]
+    fn validate_rejects_agent_without_process_names() {
+        let mut cfg = valid_config();
+        cfg.agents[0].process_names.clear();
+        let msg = err_of(&cfg);
+        assert!(msg.contains("process_names"), "got {msg}");
+        assert!(msg.contains("never match"), "got {msg}");
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_agent_ids() {
+        let mut cfg = valid_config();
+        let dup = cfg.agents[0].clone();
+        cfg.agents.push(dup);
+        assert!(err_of(&cfg).contains("duplicate"));
+    }
+
+    #[test]
+    fn validate_rejects_more_than_two_buttons() {
+        let mut cfg = valid_config();
+        cfg.agents[0].buttons = (0..3)
+            .map(|i| ButtonConfig {
+                label: format!("b{i}"),
+                url: "https://example.com".into(),
+            })
+            .collect();
+        let msg = err_of(&cfg);
+        assert!(msg.contains("3 buttons"), "got {msg}");
+        assert!(msg.contains("truncation"), "got {msg}");
+    }
+
+    #[test]
+    fn validate_rejects_overlong_button_label() {
+        let mut cfg = valid_config();
+        cfg.agents[0].buttons = vec![ButtonConfig {
+            label: "x".repeat(BUTTON_LABEL_MAX_CHARS + 1),
+            url: "https://example.com".into(),
+        }];
+        assert!(err_of(&cfg).contains("characters"));
+
+        // Exactly at the limit is fine.
+        let mut ok = valid_config();
+        ok.agents[0].buttons = vec![ButtonConfig {
+            label: "x".repeat(BUTTON_LABEL_MAX_CHARS),
+            url: "https://example.com".into(),
+        }];
+        ok.validate().expect("boundary label should be accepted");
+    }
+
+    #[test]
+    fn button_label_limit_counts_characters_not_bytes() {
+        // 32 multi-byte characters is 96 bytes but a legal Discord label.
+        let label = "é".repeat(BUTTON_LABEL_MAX_CHARS);
+        assert!(label.len() > BUTTON_LABEL_MAX_CHARS);
+        let mut cfg = valid_config();
+        cfg.agents[0].buttons = vec![ButtonConfig {
+            label,
+            url: "https://example.com".into(),
+        }];
+        cfg.validate()
+            .expect("32 chars should pass regardless of byte length");
+    }
+
+    #[test]
+    fn validate_rejects_bad_button_urls() {
+        for bad in [
+            "",
+            "example.com",
+            "ftp://example.com",
+            "javascript:alert(1)",
+        ] {
+            let mut cfg = valid_config();
+            cfg.agents[0].buttons = vec![ButtonConfig {
+                label: "Docs".into(),
+                url: bad.into(),
+            }];
+            assert!(
+                cfg.validate().is_err(),
+                "url {bad:?} should have been rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_overlong_button_url() {
+        let mut cfg = valid_config();
+        let long = format!("https://example.com/{}", "a".repeat(BUTTON_URL_MAX_CHARS));
+        cfg.agents[0].buttons = vec![ButtonConfig {
+            label: "Docs".into(),
+            url: long,
+        }];
+        assert!(err_of(&cfg).contains("at most"));
+    }
+
+    fn rule_named(name: &str) -> PresenceRule {
+        PresenceRule {
+            name: name.into(),
+            when: RuleWhen::default(),
+            then: RuleThen {
+                hide_host: true,
+                state: None,
+            },
+        }
+    }
+
+    #[test]
+    fn validate_rejects_rule_with_empty_then() {
+        let mut cfg = valid_config();
+        cfg.rules = vec![PresenceRule {
+            name: "noop".into(),
+            when: RuleWhen::default(),
+            then: RuleThen::default(),
+        }];
+        let msg = err_of(&cfg);
+        assert!(msg.contains("does nothing"), "got {msg}");
+        assert!(msg.contains("block every later rule"), "got {msg}");
+    }
+
+    #[test]
+    fn validate_rejects_rule_that_is_both_active_and_idle_only() {
+        let mut cfg = valid_config();
+        let mut rule = rule_named("impossible");
+        rule.when.active_only = true;
+        rule.when.idle_only = true;
+        cfg.rules = vec![rule];
+        assert!(err_of(&cfg).contains("never match"));
+    }
+
+    #[test]
+    fn validate_rejects_unparseable_time_windows() {
+        // Each of these previously produced a rule that silently never matched.
+        for (start, end) in [
+            ("9", "17"),
+            ("0900", "1700"),
+            ("25:00", "26:00"),
+            ("09:60", "17:00"),
+            ("", ""),
+        ] {
+            let mut cfg = valid_config();
+            let mut rule = rule_named("window");
+            rule.when.time = Some(TimeWindow {
+                start: start.into(),
+                end: end.into(),
+            });
+            cfg.rules = vec![rule];
+            assert!(
+                cfg.validate().is_err(),
+                "time window {start:?}-{end:?} should have been rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_overnight_time_window() {
+        let mut cfg = valid_config();
+        let mut rule = rule_named("after_hours");
+        rule.when.time = Some(TimeWindow {
+            start: "22:00".into(),
+            end: "06:00".into(),
+        });
+        cfg.rules = vec![rule];
+        cfg.validate().expect("overnight windows are legal");
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_rule_names_and_empty_state() {
+        let mut cfg = valid_config();
+        cfg.rules = vec![rule_named("dup"), rule_named("dup")];
+        assert!(err_of(&cfg).contains("duplicate"));
+
+        let mut cfg2 = valid_config();
+        cfg2.rules = vec![PresenceRule {
+            name: "blank".into(),
+            when: RuleWhen::default(),
+            then: RuleThen {
+                hide_host: false,
+                state: Some("   ".into()),
+            },
+        }];
+        assert!(err_of(&cfg2).contains("empty then.state"));
+    }
+
+    #[test]
+    fn validation_errors_name_the_offending_entry() {
+        let mut cfg = valid_config();
+        cfg.agents[0].id = "codex".into();
+        cfg.agents[0].buttons = vec![ButtonConfig {
+            label: "Docs".into(),
+            url: "nope".into(),
+        }];
+        let msg = err_of(&cfg);
+        assert!(
+            msg.contains("codex"),
+            "error should locate the agent: {msg}"
+        );
+    }
+
+    #[test]
+    fn every_preset_passes_validation() {
+        let mut cfg = sample_config();
+        cfg.agents = agent_presets();
+        cfg.validate()
+            .expect("shipped presets must be a valid config");
+    }
+
+    #[test]
+    fn presets_have_unique_ids_and_priorities() {
+        let presets = agent_presets();
+        assert!(presets.len() >= 10, "expected a broad preset table");
+
+        let mut ids: Vec<&str> = presets.iter().map(|a| a.id.as_str()).collect();
+        ids.sort_unstable();
+        let before = ids.len();
+        ids.dedup();
+        assert_eq!(before, ids.len(), "preset ids must be unique");
+
+        let mut prios: Vec<i32> = presets.iter().map(|a| a.priority).collect();
+        prios.sort_unstable();
+        let before = prios.len();
+        prios.dedup();
+        assert_eq!(
+            before,
+            prios.len(),
+            "preset priorities must be unique so agent selection is deterministic"
+        );
+    }
+
+    #[test]
+    fn presets_are_well_formed() {
+        for agent in agent_presets() {
+            assert!(
+                !agent.process_names.is_empty(),
+                "{} has no process_names",
+                agent.id
+            );
+            assert!(agent.label.is_some(), "{} has no label", agent.id);
+            // Lowercase, underscore-separated ids keep `agents disable <id>` predictable.
+            assert!(
+                agent
+                    .id
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                "{} is not a lowercase snake_case id",
+                agent.id
+            );
+            for name in &agent.process_names {
+                assert_eq!(
+                    name.trim(),
+                    name.as_str(),
+                    "{}: process name {name:?} has surrounding whitespace",
+                    agent.id
+                );
+                assert!(
+                    name.len() >= 3,
+                    "{}: process name {name:?} is short enough to collide with unrelated binaries",
+                    agent.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preset_asset_keys_include_devsignal_and_are_unique() {
+        let keys = preset_asset_keys();
+        assert_eq!(keys.first().map(String::as_str), Some("devsignal"));
+        let mut sorted = keys.clone();
+        sorted.sort();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(before, sorted.len(), "asset keys must be unique");
+        for agent in agent_presets() {
+            if let Some(key) = &agent.large_image {
+                assert!(keys.contains(key), "{key} missing from the upload list");
+            }
+        }
+    }
+
+    /// Drift guard: the annotated example config is hand-written, but it must not fall behind the
+    /// preset table the wizard uses. Historically these were two independent hardcoded copies.
+    #[test]
+    fn config_example_covers_every_preset_id() {
+        let raw = include_str!("../../../config.example.toml");
+        let cfg: Config = toml::from_str(raw).expect("config.example.toml must parse");
+        cfg.validate()
+            .expect_err("the shipped example has a placeholder client_id, so it must not validate");
+
+        let example_ids: Vec<&str> = cfg.agents.iter().map(|a| a.id.as_str()).collect();
+        for preset in agent_presets() {
+            assert!(
+                example_ids.contains(&preset.id.as_str()),
+                "config.example.toml is missing preset {:?}",
+                preset.id
+            );
+        }
+        for id in &example_ids {
+            assert!(
+                agent_presets().iter().any(|p| p.id == *id),
+                "config.example.toml has agent {id:?} with no matching preset"
+            );
         }
     }
 

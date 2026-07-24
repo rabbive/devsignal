@@ -1,19 +1,22 @@
 use anyhow::{Context, Result};
 use console::style;
 use devsignal_core::{
-    AgentRule, ButtonConfig, Config, DiscordSection, IdleMode, PlatformsConfig, PresenceRule,
-    RuleThen, RuleWhen, TimeWindow, HOST_BUNDLE_LABELS,
+    agent_presets, parse_numeric_id, AgentRule, Config, DiscordSection, IdleMode, PlatformsConfig,
+    PresenceRule, RuleThen, RuleWhen, TimeWindow, HOST_BUNDLE_LABELS,
 };
 use dialoguer::{Confirm, Input, MultiSelect, Select};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// How much detail reaches Discord. These must differ in behaviour, not just in wording:
+/// `Minimal` hides the host via a catch-all rule, `Balanced` shows the host, `Detailed` adds the
+/// project directory name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrivacyPreset {
     Minimal,
-    ProjectSafe,
-    PublicOss,
+    Balanced,
+    Detailed,
     Custom,
 }
 
@@ -26,61 +29,10 @@ fn banner() -> &'static str {
 ╚═════╝ ╚══════╝  ╚═══╝  ╚══════╝╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═╝╚══════╝"#
 }
 
-fn parse_numeric_id(raw: &str) -> Result<String> {
-    let s = raw.trim();
-    anyhow::ensure!(!s.is_empty(), "Discord Application ID cannot be empty");
-    anyhow::ensure!(
-        s.chars().all(|c| c.is_ascii_digit()),
-        "Discord Application ID must be numeric"
-    );
-    Ok(s.to_string())
-}
-
+/// The shipped preset table lives in `devsignal-core` so the wizard and `config.example.toml`
+/// cannot drift apart.
 fn default_agents() -> Vec<AgentRule> {
-    vec![
-        AgentRule {
-            id: "claude_code".to_string(),
-            label: Some("Claude Code".to_string()),
-            process_names: vec!["claude".to_string(), "claude-code".to_string()],
-            argv_substrings: vec![],
-            large_image: Some("claude".to_string()),
-            priority: 10,
-            small_image: Some("devsignal".to_string()),
-            small_text: Some("devsignal".to_string()),
-            buttons: vec![ButtonConfig {
-                label: "Claude Code Docs".to_string(),
-                url: "https://claude.ai/code".to_string(),
-            }],
-        },
-        AgentRule {
-            id: "codex".to_string(),
-            label: Some("Codex".to_string()),
-            process_names: vec!["codex".to_string()],
-            argv_substrings: vec![],
-            large_image: Some("codex".to_string()),
-            priority: 20,
-            small_image: Some("devsignal".to_string()),
-            small_text: Some("devsignal".to_string()),
-            buttons: vec![ButtonConfig {
-                label: "Codex on GitHub".to_string(),
-                url: "https://github.com/openai/codex".to_string(),
-            }],
-        },
-        AgentRule {
-            id: "opencode".to_string(),
-            label: Some("OpenCode".to_string()),
-            process_names: vec!["opencode".to_string()],
-            argv_substrings: vec![],
-            large_image: Some("opencode".to_string()),
-            priority: 30,
-            small_image: Some("devsignal".to_string()),
-            small_text: Some("devsignal".to_string()),
-            buttons: vec![ButtonConfig {
-                label: "OpenCode Docs".to_string(),
-                url: "https://opencode.ai".to_string(),
-            }],
-        },
-    ]
+    agent_presets()
 }
 
 fn generate_config(
@@ -118,44 +70,63 @@ fn write_config_file(path: &Path, cfg: &Config, overwrite: bool) -> Result<()> {
             path.display()
         );
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create config directory {}", parent.display()))?;
-    }
-    let toml = toml::to_string_pretty(cfg).context("serialize config to TOML")?;
-    fs::write(path, toml).with_context(|| format!("write config {}", path.display()))?;
-    Ok(())
+    crate::config_io::write_config_atomic(path, cfg)
 }
 
 fn choose_privacy_preset() -> Result<PrivacyPreset> {
     let items = vec![
-        "Minimal (agent + host only)",
-        "Project-safe (agent + host + project basename)",
-        "Public/OSS (polished copy, no project names by default)",
+        "Minimal — agent only (host hidden)",
+        "Balanced — agent + editor/terminal",
+        "Detailed — agent + editor/terminal + project folder name",
         "Custom",
     ];
     let idx = Select::new()
-        .with_prompt("Choose a privacy preset")
+        .with_prompt("How much should Discord show?")
         .items(&items)
-        .default(2)
+        .default(1)
         .interact()
         .context("read preset selection")?;
 
     Ok(match idx {
         0 => PrivacyPreset::Minimal,
-        1 => PrivacyPreset::ProjectSafe,
-        2 => PrivacyPreset::PublicOss,
+        1 => PrivacyPreset::Balanced,
+        2 => PrivacyPreset::Detailed,
         _ => PrivacyPreset::Custom,
     })
 }
 
+/// `Minimal` needs a catch-all rule to suppress the host label. It goes *last* so any rule the user
+/// picked in `choose_rule_presets` still wins under first-match-wins.
+fn privacy_preset_rules(preset: PrivacyPreset) -> Vec<PresenceRule> {
+    if preset != PrivacyPreset::Minimal {
+        return vec![];
+    }
+    vec![PresenceRule {
+        name: "minimal_hide_host".into(),
+        when: RuleWhen::default(),
+        then: RuleThen {
+            hide_host: true,
+            state: None,
+        },
+    }]
+}
+
 fn choose_agents() -> Result<Vec<AgentRule>> {
     let defaults = default_agents();
-    let labels = vec!["Claude Code", "Codex", "OpenCode"];
+    let labels = defaults
+        .iter()
+        .map(|a| {
+            let name = a.label.clone().unwrap_or_else(|| a.id.clone());
+            format!("{name} ({})", a.process_names.join(", "))
+        })
+        .collect::<Vec<_>>();
+    let all = vec![true; labels.len()];
     let selections = MultiSelect::new()
-        .with_prompt("Select which agent rules to include")
+        .with_prompt(
+            "Select which agent CLIs to watch (space toggles; a rule only matters when that CLI runs)",
+        )
         .items(&labels)
-        .defaults(&[true, true, true])
+        .defaults(&all)
         .interact()
         .context("read agent selection")?;
 
@@ -293,16 +264,26 @@ fn launch_agent_template() -> &'static str {
     include_str!("../../../packaging/macos/com.devsignal.daemon.example.plist")
 }
 
+/// Escape a path for interpolation into a plist `<string>`. A home or config path containing `&`
+/// or `<` would otherwise produce a malformed plist that `launchctl bootstrap` rejects with an
+/// opaque error.
+fn xml_escape(raw: &str) -> String {
+    raw.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 fn generate_launch_agent_plist(bin_path: &Path, config_path: &Path) -> Result<String> {
     let home = std::env::var("HOME").context("HOME is not set")?;
-    let mut plist = launch_agent_template()
-        .replace(
-            "/REPLACE/WITH/ABSOLUTE/PATH/TO/devsignal",
-            &bin_path.to_string_lossy(),
-        )
-        .replace("REPLACE_HOME", &home);
+    let bin = xml_escape(&bin_path.to_string_lossy());
+    let config = xml_escape(&config_path.to_string_lossy());
 
-    // Replace ProgramArguments array to include `--config <path>`.
+    let mut plist = launch_agent_template()
+        .replace("/REPLACE/WITH/ABSOLUTE/PATH/TO/devsignal", &bin)
+        .replace("REPLACE_HOME", &xml_escape(&home));
+
+    // Rewrite the ProgramArguments array to add `--config <path>`: launchd runs with a minimal
+    // environment, so the daemon must not rely on resolving the default path itself.
     let key = "<key>ProgramArguments</key>";
     let start = plist
         .find(key)
@@ -316,18 +297,13 @@ fn generate_launch_agent_plist(bin_path: &Path, config_path: &Path) -> Result<St
         .map(|i| array_open + i + "</array>".len())
         .context("ProgramArguments </array> not found")?;
 
-    let mut new_array = String::new();
-    new_array.push_str("<array>\n");
-    new_array.push_str(&format!(
-        "    <string>{}</string>\n",
-        bin_path.to_string_lossy()
-    ));
-    new_array.push_str("    <string>--config</string>\n");
-    new_array.push_str(&format!(
-        "    <string>{}</string>\n",
-        config_path.to_string_lossy()
-    ));
-    new_array.push_str("  </array>");
+    let new_array = format!(
+        "<array>\n    \
+         <string>{bin}</string>\n    \
+         <string>--config</string>\n    \
+         <string>{config}</string>\n  \
+         </array>"
+    );
 
     plist.replace_range(array_open..array_close, &new_array);
     Ok(plist)
@@ -474,8 +450,8 @@ pub fn cmd_init(config_path: &Path) -> Result<()> {
 
     let preset = choose_privacy_preset()?;
     let show_cwd_basename = match preset {
-        PrivacyPreset::Minimal | PrivacyPreset::PublicOss => false,
-        PrivacyPreset::ProjectSafe => true,
+        PrivacyPreset::Minimal | PrivacyPreset::Balanced => false,
+        PrivacyPreset::Detailed => true,
         PrivacyPreset::Custom => Confirm::new()
             .with_prompt("Show project basename (CWD leaf) in Discord?")
             .default(false)
@@ -489,15 +465,30 @@ pub fn cmd_init(config_path: &Path) -> Result<()> {
         "at least one agent must be selected (Config requires [[agents]])"
     );
     let disabled_hosts = choose_disabled_hosts()?;
-    let rules = choose_rule_presets()?;
+    // User-chosen rules first, then any rule the privacy preset implies, so the explicit choice
+    // wins under first-match-wins.
+    let mut rules = choose_rule_presets()?;
+    rules.extend(privacy_preset_rules(preset));
 
     println!();
-    println!("{}", style("Art assets (optional for now):").bold());
-    println!("If you want images later, upload keys under Discord Developer Portal → Rich Presence → Art Assets:");
-    println!("  - devsignal");
-    println!("  - claude");
-    println!("  - codex");
-    println!("  - opencode");
+    println!("{}", style("Art assets").bold());
+    println!(
+        "Presence images are Discord asset KEYS, uploaded under\n\
+         Developer Portal → Rich Presence → Art Assets. A key you have not uploaded renders blank —\n\
+         remove the large_image line for that agent to fall back to \"devsignal\"."
+    );
+    println!("Keys referenced by your selection:");
+    let mut keys = vec!["devsignal".to_string()];
+    for agent in &agents {
+        if let Some(key) = &agent.large_image {
+            if !keys.contains(key) {
+                keys.push(key.clone());
+            }
+        }
+    }
+    for key in &keys {
+        println!("  - {key}");
+    }
     println!();
 
     let overwrite = if config_path.exists() {
@@ -521,9 +512,7 @@ pub fn cmd_init(config_path: &Path) -> Result<()> {
         rules,
     );
     write_config_file(config_path, &cfg, overwrite)?;
-
-    // Validate by re-loading from disk (uses core validation).
-    let _ = Config::load_from_path(config_path).context("validate written config")?;
+    // write_config_atomic validates before replacing the file, so reaching here means it loads.
 
     println!();
     println!("{}", style("Config written and validated.").green().bold());
@@ -540,18 +529,158 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_numeric_id_rejects_non_digits() {
-        assert!(parse_numeric_id("abc").is_err());
-        assert!(parse_numeric_id("123a").is_err());
-        assert!(parse_numeric_id("").is_err());
-        assert_eq!(parse_numeric_id("123").unwrap(), "123");
-    }
-
-    #[test]
     fn generate_config_sets_cwd_flag() {
         let cfg = generate_config("1".into(), true, default_agents(), vec![], vec![]);
         assert!(cfg.show_cwd_basename);
         assert_eq!(cfg.discord.client_id, "1");
         assert!(!cfg.agents.is_empty());
+    }
+
+    #[test]
+    fn wizard_defaults_come_from_the_core_preset_table() {
+        let wizard: Vec<String> = default_agents().into_iter().map(|a| a.id).collect();
+        let core: Vec<String> = agent_presets().into_iter().map(|a| a.id).collect();
+        assert_eq!(wizard, core);
+    }
+
+    #[test]
+    fn generated_config_from_presets_is_valid() {
+        let cfg = generate_config("123456789".into(), false, default_agents(), vec![], vec![]);
+        cfg.validate().expect("wizard output must load");
+    }
+
+    /// Regression: the old `PublicOss` preset was byte-identical in behaviour to `Minimal`.
+    #[test]
+    fn each_privacy_preset_produces_a_distinct_config() {
+        let shape = |preset: PrivacyPreset, show_cwd: bool| {
+            let cfg = generate_config(
+                "123456789".into(),
+                show_cwd,
+                default_agents(),
+                vec![],
+                privacy_preset_rules(preset),
+            );
+            cfg.validate().expect("preset output must load");
+            (cfg.show_cwd_basename, cfg.rules.len())
+        };
+
+        let minimal = shape(PrivacyPreset::Minimal, false);
+        let balanced = shape(PrivacyPreset::Balanced, false);
+        let detailed = shape(PrivacyPreset::Detailed, true);
+
+        assert_ne!(minimal, balanced, "Minimal and Balanced must differ");
+        assert_ne!(balanced, detailed, "Balanced and Detailed must differ");
+        assert_ne!(minimal, detailed, "Minimal and Detailed must differ");
+
+        // Minimal is the only one that needs a rule, and it hides the host.
+        assert_eq!(minimal.1, 1);
+        assert_eq!(balanced.1, 0);
+        assert_eq!(detailed.1, 0);
+    }
+
+    #[test]
+    fn minimal_privacy_rule_hides_host_and_is_a_catch_all() {
+        let rules = privacy_preset_rules(PrivacyPreset::Minimal);
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].then.hide_host);
+        assert!(rules[0].then.state.is_none());
+        // A catch-all `when` is what makes it a fallback for every situation.
+        assert!(rules[0].when.host_bundle_ids.is_empty());
+        assert!(rules[0].when.agent_ids.is_empty());
+        assert!(!rules[0].when.active_only);
+        assert!(!rules[0].when.idle_only);
+
+        for other in [PrivacyPreset::Balanced, PrivacyPreset::Detailed] {
+            assert!(privacy_preset_rules(other).is_empty());
+        }
+    }
+
+    /// The template must stay well-formed XML. It previously contained `--` inside an XML comment
+    /// (from `cargo build --release`), which is illegal and rejected by any strict parser.
+    #[test]
+    fn launch_agent_template_has_no_double_hyphen_in_comments() {
+        let tpl = launch_agent_template();
+        let start = tpl.find("<!--").expect("template has a comment");
+        let end = tpl.find("-->").expect("comment is closed");
+        let body = &tpl[start + 4..end];
+        assert!(
+            !body.contains("--"),
+            "XML comments must not contain a double hyphen"
+        );
+    }
+
+    #[test]
+    fn generated_plist_contains_binary_and_config_paths() {
+        std::env::set_var("HOME", "/Users/demo");
+        let plist = generate_launch_agent_plist(
+            Path::new("/Users/demo/bin/devsignal"),
+            Path::new("/Users/demo/.config/devsignal/config.toml"),
+        )
+        .expect("generate");
+
+        assert!(plist.contains("<string>/Users/demo/bin/devsignal</string>"));
+        assert!(plist.contains("<string>--config</string>"));
+        assert!(
+            plist.contains("<string>/Users/demo/.config/devsignal/config.toml</string>"),
+            "config path must be passed explicitly"
+        );
+        // The placeholders must all be substituted.
+        assert!(!plist.contains("REPLACE_HOME"), "REPLACE_HOME left behind");
+        assert!(
+            !plist.contains("/REPLACE/WITH"),
+            "binary placeholder left behind"
+        );
+        assert!(plist.contains("/Users/demo/Library/Logs/devsignal/devsignal.out.log"));
+        // Exactly one array, and tags stay balanced after the surgery.
+        assert_eq!(plist.matches("<array>").count(), 1);
+        assert_eq!(plist.matches("</array>").count(), 1);
+        assert_eq!(plist.matches("<plist").count(), 1);
+        assert_eq!(plist.matches("</plist>").count(), 1);
+    }
+
+    #[test]
+    fn generated_plist_escapes_xml_significant_characters() {
+        std::env::set_var("HOME", "/Users/a&b");
+        let plist = generate_launch_agent_plist(
+            Path::new("/Users/a&b/bin/devsignal"),
+            Path::new("/Users/a&b/cfg<1>.toml"),
+        )
+        .expect("generate");
+
+        assert!(plist.contains("/Users/a&amp;b/bin/devsignal"));
+        assert!(plist.contains("cfg&lt;1&gt;.toml"));
+        // No bare ampersand may survive: every & must begin an entity.
+        for (idx, _) in plist.match_indices('&') {
+            let tail = &plist[idx..];
+            assert!(
+                tail.starts_with("&amp;") || tail.starts_with("&lt;") || tail.starts_with("&gt;"),
+                "bare & at byte {idx} would make the plist malformed"
+            );
+        }
+    }
+
+    #[test]
+    fn xml_escape_handles_each_significant_character() {
+        assert_eq!(xml_escape("a&b"), "a&amp;b");
+        assert_eq!(xml_escape("a<b>c"), "a&lt;b&gt;c");
+        assert_eq!(xml_escape("plain/path"), "plain/path");
+        // Ampersand is escaped first, so an escape is not double-escaped.
+        assert_eq!(xml_escape("&lt;"), "&amp;lt;");
+    }
+
+    /// The privacy fallback must not shadow a rule the user explicitly chose.
+    #[test]
+    fn privacy_rule_is_appended_after_user_rules() {
+        let mut rules = vec![PresenceRule {
+            name: "user_rule".into(),
+            when: RuleWhen::default(),
+            then: RuleThen {
+                hide_host: false,
+                state: Some("Streaming".into()),
+            },
+        }];
+        rules.extend(privacy_preset_rules(PrivacyPreset::Minimal));
+        assert_eq!(rules[0].name, "user_rule");
+        assert_eq!(rules[1].name, "minimal_hide_host");
     }
 }

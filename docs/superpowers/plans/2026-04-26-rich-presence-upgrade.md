@@ -1,6 +1,12 @@
 # Rich Presence Upgrade Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **STATUS: COMPLETE.** Implemented in `581689d` (PR #1, merged 2026-04-27) and shipped in v0.3.0.
+> The checkboxes below went unticked at the time; they are ticked now for the record.
+> The one item that had genuinely not been done — "`devsignal validate` prints all agents and their
+> buttons" — was completed in the v0.3.0 ship work, along with load-time validation of the button
+> label/url limits this plan documented in doc comments but never enforced.
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Extend Discord Rich Presence output with `small_image`, `small_text`, and up to 2 `buttons` per agent, configured in `config.toml` and surfaced in the Discord client.
 
@@ -27,7 +33,7 @@ No new files. No changes to `devsignal-macos`, `devsignal-daemon`, or CI.
 **Files:**
 - Stage: `CLAUDE.md` (untracked)
 
-- [ ] **Step 1: Stage and commit CLAUDE.md**
+- [x] **Step 1: Stage and commit CLAUDE.md**
 
 ```bash
 cd /Users/ashwanthkumaravel/Documents/GitHub/devsignal
@@ -44,7 +50,7 @@ Expected: commit created, clean `git status`.
 **Files:**
 - Modify: `crates/devsignal-core/src/lib.rs`
 
-- [ ] **Step 1: Write failing tests for new config fields**
+- [x] **Step 1: Write failing tests for new config fields**
 
 In `crates/devsignal-core/src/lib.rs`, add these tests inside the existing `#[cfg(test)] mod tests { ... }` block, before the closing `}`:
 
@@ -92,7 +98,7 @@ fn discord_section_deserializes_small_image_defaults() {
 }
 ```
 
-- [ ] **Step 2: Run tests to confirm they fail**
+- [x] **Step 2: Run tests to confirm they fail**
 
 ```bash
 cd /Users/ashwanthkumaravel/Documents/GitHub/devsignal
@@ -102,7 +108,7 @@ cargo test -p devsignal-core discord_section_deserializes 2>&1 | tail -20
 
 Expected: compile error — fields `small_image`, `small_text`, `buttons` do not exist on `AgentRule`.
 
-- [ ] **Step 3: Add `ButtonConfig` struct and extend `AgentRule` and `DiscordSection`**
+- [x] **Step 3: Add `ButtonConfig` struct and extend `AgentRule` and `DiscordSection`**
 
 In `crates/devsignal-core/src/lib.rs`, add the `ButtonConfig` struct directly after the `AgentRule` struct definition (around line 79):
 
@@ -142,7 +148,7 @@ pub small_image: Option<String>,
 pub small_text: Option<String>,
 ```
 
-- [ ] **Step 4: Run tests to confirm they pass**
+- [x] **Step 4: Run tests to confirm they pass**
 
 ```bash
 cargo test -p devsignal-core agent_rule_deserializes 2>&1 | tail -10
@@ -151,7 +157,7 @@ cargo test -p devsignal-core discord_section_deserializes 2>&1 | tail -10
 
 Expected: `test agent_rule_deserializes_small_image_and_buttons ... ok` and `test discord_section_deserializes_small_image_defaults ... ok`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/devsignal-core/src/lib.rs
@@ -165,7 +171,7 @@ git commit -m "feat(core): add ButtonConfig, small_image/small_text to AgentRule
 **Files:**
 - Modify: `crates/devsignal-core/src/lib.rs`
 
-- [ ] **Step 1: Write failing tests for extended PresenceView**
+- [x] **Step 1: Write failing tests for extended PresenceView**
 
 Add these tests inside `#[cfg(test)] mod tests { ... }`:
 
@@ -221,7 +227,7 @@ fn build_presence_view_no_small_image_returns_none() {
 }
 ```
 
-- [ ] **Step 2: Run tests to confirm they fail**
+- [x] **Step 2: Run tests to confirm they fail**
 
 ```bash
 cargo test -p devsignal-core build_presence_view_propagates 2>&1 | tail -20
@@ -229,7 +235,7 @@ cargo test -p devsignal-core build_presence_view_propagates 2>&1 | tail -20
 
 Expected: compile error — `ActiveAgent` has no `small_image`/`small_text`/`buttons` fields; `PresenceView` has no `small_image`/`small_text`/`buttons` fields.
 
-- [ ] **Step 3: Extend `ActiveAgent` and `PresenceView`**
+- [x] **Step 3: Extend `ActiveAgent` and `PresenceView`**
 
 Replace the existing `ActiveAgent` struct:
 
@@ -261,7 +267,7 @@ pub struct PresenceView {
 }
 ```
 
-- [ ] **Step 4: Fix `select_active_agent` to populate the new fields**
+- [x] **Step 4: Fix `select_active_agent` to populate the new fields**
 
 Update the `select_active_agent` function body — replace the `ActiveAgent { ... }` construction:
 
@@ -276,7 +282,7 @@ let agent = ActiveAgent {
 };
 ```
 
-- [ ] **Step 5: Fix `build_presence_view` to populate new fields**
+- [x] **Step 5: Fix `build_presence_view` to populate new fields**
 
 Replace the entire `build_presence_view` function:
 
@@ -322,7 +328,7 @@ pub fn build_presence_view(
 }
 ```
 
-- [ ] **Step 6: Fix existing tests that construct `ActiveAgent` directly**
+- [x] **Step 6: Fix existing tests that construct `ActiveAgent` directly**
 
 The existing test `build_presence_view_agent_and_idle` in the test module constructs `ActiveAgent` with the old fields. Update it to include the new fields:
 
@@ -379,7 +385,7 @@ fn rule(id: &str, priority: i32) -> AgentRule {
 }
 ```
 
-- [ ] **Step 7: Run all core tests**
+- [x] **Step 7: Run all core tests**
 
 ```bash
 cargo test -p devsignal-core 2>&1 | tail -30
@@ -387,7 +393,7 @@ cargo test -p devsignal-core 2>&1 | tail -30
 
 Expected: all tests pass (should be ~13+ tests now).
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add crates/devsignal-core/src/lib.rs
@@ -401,7 +407,7 @@ git commit -m "feat(core): extend ActiveAgent and PresenceView with small_image,
 **Files:**
 - Modify: `crates/devsignal-discord/src/lib.rs`
 
-- [ ] **Step 1: Read the current `set_presence` implementation**
+- [x] **Step 1: Read the current `set_presence` implementation**
 
 ```bash
 cat -n /Users/ashwanthkumaravel/Documents/GitHub/devsignal/crates/devsignal-discord/src/lib.rs
@@ -409,7 +415,7 @@ cat -n /Users/ashwanthkumaravel/Documents/GitHub/devsignal/crates/devsignal-disc
 
 Confirm the `set_presence` method currently builds `assets` using only `large_image`/`large_text`, and `act` has no `buttons()` call.
 
-- [ ] **Step 2: Update `set_presence` to wire small_image, small_text, and buttons**
+- [x] **Step 2: Update `set_presence` to wire small_image, small_text, and buttons**
 
 Replace the body of `set_presence` (the `pub fn set_presence` method on `PresenceSession`) with:
 
@@ -451,7 +457,7 @@ pub fn set_presence(&mut self, view: &PresenceView) -> Result<()> {
 }
 ```
 
-- [ ] **Step 3: Run full workspace build and clippy to verify**
+- [x] **Step 3: Run full workspace build and clippy to verify**
 
 ```bash
 cargo build --workspace 2>&1 | tail -20
@@ -460,7 +466,7 @@ cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -20
 
 Expected: clean build, zero clippy warnings.
 
-- [ ] **Step 4: Run all tests**
+- [x] **Step 4: Run all tests**
 
 ```bash
 cargo test --workspace 2>&1 | tail -20
@@ -468,7 +474,7 @@ cargo test --workspace 2>&1 | tail -20
 
 Expected: all tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/devsignal-discord/src/lib.rs
@@ -482,13 +488,13 @@ git commit -m "feat(discord): wire small_image, small_text, and buttons into set
 **Files:**
 - Modify: `config.example.toml`
 
-- [ ] **Step 1: Read the current config.example.toml**
+- [x] **Step 1: Read the current config.example.toml**
 
 ```bash
 cat /Users/ashwanthkumaravel/Documents/GitHub/devsignal/config.example.toml
 ```
 
-- [ ] **Step 2: Rewrite config.example.toml with new fields**
+- [x] **Step 2: Rewrite config.example.toml with new fields**
 
 Replace the entire file contents with:
 
@@ -556,7 +562,7 @@ small_text    = "devsignal"
   url   = "https://opencode.ai"
 ```
 
-- [ ] **Step 3: Validate the new config parses correctly**
+- [x] **Step 3: Validate the new config parses correctly**
 
 ```bash
 cd /Users/ashwanthkumaravel/Documents/GitHub/devsignal
@@ -568,7 +574,7 @@ cargo run -p devsignal-daemon -- validate --config /tmp/devsignal-test.toml
 
 Expected output: `OK: /tmp/devsignal-test.toml` followed by lines listing all 3 agents with `small_image` and `buttons` fields visible.
 
-- [ ] **Step 4: Run full test suite one more time**
+- [x] **Step 4: Run full test suite one more time**
 
 ```bash
 cargo test --workspace 2>&1 | tail -20
@@ -576,7 +582,7 @@ cargo test --workspace 2>&1 | tail -20
 
 Expected: all tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add config.example.toml
@@ -589,14 +595,14 @@ git commit -m "feat(config): add small_image, small_text, and buttons to all exa
 
 **Files:** none (verification only)
 
-- [ ] **Step 1: Scaffold local config from updated example**
+- [x] **Step 1: Scaffold local config from updated example**
 
 ```bash
 cp /Users/ashwanthkumaravel/Documents/GitHub/devsignal/config.example.toml /tmp/devsignal-once-test.toml
 sed -i '' 's/YOUR_DISCORD_APPLICATION_ID/123456789012345678/' /tmp/devsignal-once-test.toml
 ```
 
-- [ ] **Step 2: Run `once` subcommand and inspect output**
+- [x] **Step 2: Run `once` subcommand and inspect output**
 
 ```bash
 cd /Users/ashwanthkumaravel/Documents/GitHub/devsignal
@@ -620,7 +626,7 @@ Expected: pretty-printed JSON containing `small_image`, `small_text`, and `butto
 
 If an agent (e.g. `claude`) is running, `buttons` will contain the configured entries.
 
-- [ ] **Step 3: Tag and push**
+- [x] **Step 3: Tag and push**
 
 ```bash
 cd /Users/ashwanthkumaravel/Documents/GitHub/devsignal
@@ -634,9 +640,9 @@ Expected: CI passes, release workflow fires and produces `devsignal-0.3.0-macos-
 
 ## Verification Checklist
 
-- [ ] `cargo fmt --all -- --check` passes
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes
-- [ ] `cargo test --workspace` — all tests pass (13+ tests in `devsignal-core`)
-- [ ] `devsignal once --config /tmp/devsignal-once-test.toml` outputs JSON with `small_image`, `small_text`, `buttons` fields
-- [ ] `devsignal validate --config /tmp/devsignal-once-test.toml` prints OK with all 3 agents and their buttons
-- [ ] Running `devsignal run` against Discord desktop shows small icon + buttons in the presence panel
+- [x] `cargo fmt --all -- --check` passes
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` passes
+- [x] `cargo test --workspace` — all tests pass (13+ tests in `devsignal-core`)
+- [x] `devsignal once --config /tmp/devsignal-once-test.toml` outputs JSON with `small_image`, `small_text`, `buttons` fields
+- [x] `devsignal validate --config /tmp/devsignal-once-test.toml` prints OK with all 3 agents and their buttons
+- [x] Running `devsignal run` against Discord desktop shows small icon + buttons in the presence panel

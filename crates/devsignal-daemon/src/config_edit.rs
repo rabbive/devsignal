@@ -175,9 +175,22 @@ fn load_config(path: &Path) -> Result<Config> {
 }
 
 fn write_config(path: &Path, cfg: &Config) -> Result<()> {
-    let toml = toml::to_string_pretty(cfg).context("serialize config")?;
-    std::fs::write(path, toml).with_context(|| format!("write config {}", path.display()))?;
-    let _ = Config::load_from_path(path).context("validate rewritten config")?;
+    crate::config_io::write_config_atomic(path, cfg)
+}
+
+/// Persist the change, then report it. Rewriting the config from the parsed struct drops comments,
+/// and a running daemon reads its config only at startup — say both out loud rather than letting the
+/// user wonder why nothing happened.
+fn commit(path: &Path, cfg: &Config, message: &str) -> Result<()> {
+    write_config(path, cfg)?;
+    println!("{message}");
+    println!(
+        "  wrote {} (comments and key order are not preserved)",
+        path.display()
+    );
+    println!(
+        "  restart the daemon to apply: launchctl kickstart -k gui/$(id -u)/com.devsignal.daemon"
+    );
     Ok(())
 }
 
@@ -221,16 +234,12 @@ fn run_hosts(cmd: HostsCommand) -> Result<()> {
         HostsCommand::Enable { config, id } => {
             let mut cfg = load_config(&config)?;
             remove_case_insensitive(&mut cfg.platforms.disabled_hosts, &id);
-            write_config(&config, &cfg)?;
-            println!("enabled host: {id}");
-            Ok(())
+            commit(&config, &cfg, &format!("enabled host: {id}"))
         }
         HostsCommand::Disable { config, id } => {
             let mut cfg = load_config(&config)?;
             add_unique_case_insensitive(&mut cfg.platforms.disabled_hosts, id.clone());
-            write_config(&config, &cfg)?;
-            println!("disabled host: {id}");
-            Ok(())
+            commit(&config, &cfg, &format!("disabled host: {id}"))
         }
     }
 }
@@ -257,16 +266,12 @@ fn run_agents(cmd: AgentsCommand) -> Result<()> {
         AgentsCommand::Enable { config, id } => {
             let mut cfg = load_config(&config)?;
             remove_case_insensitive(&mut cfg.platforms.disabled_agents, &id);
-            write_config(&config, &cfg)?;
-            println!("enabled agent: {id}");
-            Ok(())
+            commit(&config, &cfg, &format!("enabled agent: {id}"))
         }
         AgentsCommand::Disable { config, id } => {
             let mut cfg = load_config(&config)?;
             add_unique_case_insensitive(&mut cfg.platforms.disabled_agents, id.clone());
-            write_config(&config, &cfg)?;
-            println!("disabled agent: {id}");
-            Ok(())
+            commit(&config, &cfg, &format!("disabled agent: {id}"))
         }
     }
 }
@@ -288,9 +293,7 @@ fn run_rules(cmd: RulesCommand) -> Result<()> {
             let before = cfg.rules.len();
             cfg.rules.retain(|rule| rule.name != name);
             anyhow::ensure!(cfg.rules.len() != before, "rule not found: {name}");
-            write_config(&config, &cfg)?;
-            println!("removed rule: {name}");
-            Ok(())
+            commit(&config, &cfg, &format!("removed rule: {name}"))
         }
         RulesCommand::Add { config, rule } => {
             let mut cfg = load_config(&config)?;
@@ -301,9 +304,165 @@ fn run_rules(cmd: RulesCommand) -> Result<()> {
             );
             let name = rule.name.clone();
             cfg.rules.push(rule);
-            write_config(&config, &cfg)?;
-            println!("added rule: {name}");
-            Ok(())
+            commit(&config, &cfg, &format!("added rule: {name}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn take_config_extracts_the_flag_from_anywhere_in_the_args() {
+        let mut args = argv(&["disable", "--config", "/tmp/a.toml", "com.apple.Terminal"]);
+        let path = take_config(&mut args).expect("parse");
+        assert_eq!(path, PathBuf::from("/tmp/a.toml"));
+        // The flag and its value are consumed, leaving the positional arguments.
+        assert_eq!(args, argv(&["disable", "com.apple.Terminal"]));
+    }
+
+    #[test]
+    fn take_config_defaults_and_rejects_a_missing_value() {
+        let mut args = argv(&["list"]);
+        assert_eq!(
+            take_config(&mut args).expect("parse"),
+            Config::default_path()
+        );
+
+        let mut dangling = argv(&["list", "--config"]);
+        assert!(take_config(&mut dangling).is_err());
+    }
+
+    #[test]
+    fn hosts_and_agents_commands_parse_their_verbs() {
+        assert!(matches!(
+            parse_hosts_command(&argv(&["list"])).expect("parse"),
+            ConfigEditCommand::Hosts(HostsCommand::List { .. })
+        ));
+        match parse_agents_command(&argv(&["disable", "goose"])).expect("parse") {
+            ConfigEditCommand::Agents(AgentsCommand::Disable { id, .. }) => assert_eq!(id, "goose"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        // Missing or extra positional arguments produce the usage error.
+        assert!(parse_hosts_command(&argv(&["enable"])).is_err());
+        assert!(parse_agents_command(&argv(&["bogus", "x"])).is_err());
+    }
+
+    #[test]
+    fn rule_add_collects_repeatable_and_boolean_flags() {
+        let cmd = parse_rules_command(&argv(&[
+            "add",
+            "--name",
+            "focus",
+            "--host",
+            "com.apple.Terminal",
+            "--host",
+            "com.googlecode.iterm2",
+            "--agent",
+            "claude_code",
+            "--project",
+            "devsignal",
+            "--active-only",
+            "--hide-host",
+            "--state",
+            "Deep work",
+        ]))
+        .expect("parse");
+
+        let rule = match cmd {
+            ConfigEditCommand::Rules(RulesCommand::Add { rule, .. }) => rule,
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(rule.name, "focus");
+        assert_eq!(rule.when.host_bundle_ids.len(), 2, "--host is repeatable");
+        assert_eq!(rule.when.agent_ids, vec!["claude_code".to_string()]);
+        assert_eq!(rule.when.project_basenames, vec!["devsignal".to_string()]);
+        assert!(rule.when.active_only);
+        assert!(!rule.when.idle_only);
+        assert!(rule.then.hide_host);
+        assert_eq!(rule.then.state.as_deref(), Some("Deep work"));
+    }
+
+    #[test]
+    fn rule_add_parses_a_time_window() {
+        let cmd = parse_rules_command(&argv(&[
+            "add",
+            "--name",
+            "night",
+            "--time",
+            "22:00-06:00",
+            "--hide-host",
+        ]))
+        .expect("parse");
+        let rule = match cmd {
+            ConfigEditCommand::Rules(RulesCommand::Add { rule, .. }) => rule,
+            other => panic!("unexpected: {other:?}"),
+        };
+        let window = rule.when.time.expect("time window");
+        assert_eq!(window.start, "22:00");
+        assert_eq!(window.end, "06:00");
+        window.validate().expect("window should be valid");
+    }
+
+    #[test]
+    fn rule_add_requires_a_name_and_an_effect() {
+        // No --name.
+        assert!(parse_rules_command(&argv(&["add", "--hide-host"])).is_err());
+        // Neither --hide-host nor --state: the rule would match and do nothing.
+        let err = parse_rules_command(&argv(&["add", "--name", "noop"])).expect_err("should fail");
+        assert!(format!("{err}").contains("--hide-host"));
+        // Unknown flag.
+        assert!(parse_rules_command(&argv(&["add", "--name", "x", "--nope"])).is_err());
+        // Flags that require a value but have none.
+        assert!(parse_rules_command(&argv(&["add", "--name"])).is_err());
+        assert!(parse_rules_command(&argv(&["add", "--name", "x", "--time"])).is_err());
+    }
+
+    #[test]
+    fn rule_add_rejects_a_malformed_time_flag() {
+        // No separator at all is caught at parse time.
+        assert!(parse_rules_command(&argv(&[
+            "add",
+            "--name",
+            "x",
+            "--time",
+            "2200",
+            "--hide-host"
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn rules_list_and_remove_parse() {
+        assert!(matches!(
+            parse_rules_command(&argv(&["list"])).expect("parse"),
+            ConfigEditCommand::Rules(RulesCommand::List { .. })
+        ));
+        match parse_rules_command(&argv(&["remove", "focus"])).expect("parse") {
+            ConfigEditCommand::Rules(RulesCommand::Remove { name, .. }) => {
+                assert_eq!(name, "focus")
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(parse_rules_command(&argv(&["remove"])).is_err());
+    }
+
+    #[test]
+    fn disabled_list_helpers_are_case_insensitive_and_idempotent() {
+        let mut items = vec!["com.apple.Terminal".to_string()];
+
+        add_unique_case_insensitive(&mut items, "COM.APPLE.TERMINAL".into());
+        assert_eq!(items.len(), 1, "must not add a case-variant duplicate");
+
+        add_unique_case_insensitive(&mut items, "dev.zed.Zed".into());
+        assert_eq!(items.len(), 2);
+
+        remove_case_insensitive(&mut items, "com.APPLE.terminal");
+        assert_eq!(items, vec!["dev.zed.Zed".to_string()]);
     }
 }

@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "devsignal-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -152,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "devsignal-daemon"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -165,6 +165,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
+ "tempfile",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -172,7 +173,7 @@ dependencies = [
 
 [[package]]
 name = "devsignal-discord"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "devsignal-core",
@@ -182,7 +183,7 @@ dependencies = [
 
 [[package]]
 name = "devsignal-macos"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "objc2",
  "objc2-app-kit",
