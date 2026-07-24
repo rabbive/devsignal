@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 /// Top-level config loaded from `~/.config/devsignal/config.toml` (or `--config`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default = "default_poll_interval_secs")]
     pub poll_interval_secs: u64,
@@ -48,6 +49,7 @@ fn default_min_push_interval_secs() -> u64 {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiscordSection {
     /// Discord Application (Rich Presence) client ID.
     pub client_id: String,
@@ -68,6 +70,7 @@ fn default_large_image() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentRule {
     /// Stable id: `claude_code`, `codex`, `opencode`, ...
     pub id: String,
@@ -106,6 +109,7 @@ pub const MAX_BUTTONS: usize = 2;
 
 /// A Discord Rich Presence button (label + URL). Maximum 2 per presence payload.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ButtonConfig {
     /// Displayed on the button in Discord (1–32 characters).
     pub label: String,
@@ -164,6 +168,7 @@ pub fn parse_numeric_id(raw: &str) -> Result<String> {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlatformsConfig {
     #[serde(default)]
     pub disabled_hosts: Vec<String>,
@@ -172,6 +177,7 @@ pub struct PlatformsConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PresenceRule {
     pub name: String,
     #[serde(default)]
@@ -181,6 +187,7 @@ pub struct PresenceRule {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuleWhen {
     #[serde(default)]
     pub host_bundle_ids: Vec<String>,
@@ -197,6 +204,7 @@ pub struct RuleWhen {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuleThen {
     #[serde(default)]
     pub hide_host: bool,
@@ -205,6 +213,7 @@ pub struct RuleThen {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TimeWindow {
     pub start: String,
     pub end: String,
@@ -219,6 +228,11 @@ pub struct RuleContext<'a> {
     pub local_minutes: Option<u16>,
 }
 
+/// Result of evaluating `[[rules]]`.
+///
+/// `matched_rule_name` is reported to the user by `detect` and `once`. It deliberately does **not**
+/// live on [`PresenceView`]: that struct is the debouncer's equality key, so a rule-name change alone
+/// would trigger a Discord write even when the visible text is identical.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PresencePolicyOverride {
     pub matched_rule_name: Option<String>,
@@ -1317,6 +1331,68 @@ mod tests {
                 "docs/community-presets.md is missing a snippet for {expected}"
             );
         }
+    }
+
+    /// A typo'd key used to parse fine and be silently ignored, so the setting simply never applied.
+    #[test]
+    fn unknown_config_keys_are_rejected() {
+        let cases = [
+            // Misspelled top-level key.
+            r#"show_cwd_basemane = true
+               [discord]
+               client_id = "1"
+               [[agents]]
+               id = "a"
+               process_names = ["a"]"#,
+            // Misspelled table name.
+            r#"[discord]
+               client_id = "1"
+               [platform]
+               disabled_hosts = []
+               [[agents]]
+               id = "a"
+               process_names = ["a"]"#,
+            // Misspelled key inside a nested table.
+            r#"[discord]
+               client_id = "1"
+               [platforms]
+               disabled_host = []
+               [[agents]]
+               id = "a"
+               process_names = ["a"]"#,
+            // Misspelled agent field.
+            r#"[discord]
+               client_id = "1"
+               [[agents]]
+               id = "a"
+               process_name = ["a"]"#,
+            // Misspelled rule field.
+            r#"[discord]
+               client_id = "1"
+               [[agents]]
+               id = "a"
+               process_names = ["a"]
+               [[rules]]
+               name = "r"
+               then = { hide_host = true, stat = "x" }"#,
+        ];
+        for (idx, case) in cases.iter().enumerate() {
+            let err = toml::from_str::<Config>(case)
+                .expect_err(&format!("case {idx} should have been rejected"));
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("unknown field"),
+                "case {idx} should name the unknown field, got: {msg}"
+            );
+        }
+    }
+
+    /// The corollary: every key the shipped example uses must still be accepted.
+    #[test]
+    fn the_example_config_has_no_unknown_keys() {
+        let raw = include_str!("../../../config.example.toml");
+        toml::from_str::<Config>(raw)
+            .expect("config.example.toml must parse with deny_unknown_fields");
     }
 
     #[test]

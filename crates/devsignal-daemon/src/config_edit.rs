@@ -305,9 +305,8 @@ fn write_config(path: &Path, cfg: &Config) -> Result<()> {
     crate::config_io::write_config_atomic(path, cfg)
 }
 
-/// Persist the change, then report it. Rewriting the config from the parsed struct drops comments,
-/// and a running daemon reads its config only at startup — say both out loud rather than letting the
-/// user wonder why nothing happened.
+/// Persist the change, then report it. Rewriting the config from the parsed struct drops comments, so
+/// say that out loud rather than letting the user discover it.
 fn commit(path: &Path, cfg: &Config, message: &str) -> Result<()> {
     write_config(path, cfg)?;
     println!("{message}");
@@ -315,9 +314,8 @@ fn commit(path: &Path, cfg: &Config, message: &str) -> Result<()> {
         "  wrote {} (comments and key order are not preserved)",
         path.display()
     );
-    println!(
-        "  restart the daemon to apply: launchctl kickstart -k gui/$(id -u)/com.devsignal.daemon"
-    );
+    // A running daemon notices the mtime change on its next poll; no restart needed.
+    println!("  a running daemon picks this up on its next poll");
     Ok(())
 }
 

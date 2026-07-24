@@ -3,11 +3,11 @@ use chrono::Timelike;
 use devsignal_core::{
     agent_allowed, apply_rules, build_presence_view, host_allowed, host_label_for_bundle,
     process_matches_rule, redact_cwd_basename, select_active_agent, ActiveAgent, AgentRule, Config,
-    Debouncer, IdleMode, PresenceAction, PresenceView, RuleContext,
+    Debouncer, IdleMode, PresenceAction, PresencePolicyOverride, PresenceView, RuleContext,
 };
 use devsignal_discord::PresenceSession;
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
@@ -131,6 +131,11 @@ fn winner_of(candidates: &[Candidate]) -> Option<(ActiveAgent, u32)> {
     )
 }
 
+/// Build the payload, and report which `[[rules]]` entry (if any) shaped it.
+///
+/// The rule name is returned separately rather than added to `PresenceView`, because that struct is
+/// the debouncer's equality key: including it would trigger a Discord write whenever the matched rule
+/// changed, even with identical visible text.
 fn build_policy_view(
     cfg: &Config,
     agent: Option<&ActiveAgent>,
@@ -138,7 +143,7 @@ fn build_policy_view(
     session_start_unix: Option<u64>,
     cwd_basename: Option<&str>,
     local_minutes: Option<u16>,
-) -> PresenceView {
+) -> (PresenceView, PresencePolicyOverride) {
     let host_is_allowed = host_allowed(cfg, host_bundle_id);
     let ctx = RuleContext {
         host_bundle_id,
@@ -155,10 +160,10 @@ fn build_policy_view(
     if hide_host && policy.state.is_none() {
         view.state = hidden_host_state(agent.is_some(), cwd_basename);
     }
-    if let Some(state) = policy.state {
+    if let Some(state) = policy.state.clone() {
         view.state = state;
     }
-    view
+    (view, policy)
 }
 
 /// Resolve the project basename for the winning PID, when the config asks for it.
@@ -261,7 +266,7 @@ fn cmd_once(config_path: &Path) -> Result<()> {
     // Resolve the CWD exactly as `run` does, so a rule using `when.project_basenames` behaves the
     // same here as in the daemon.
     let cwd = cwd_basename_for(&sys, &cfg, selected.as_ref().map(|(_, pid)| *pid));
-    let view = build_policy_view(
+    let (view, policy) = build_policy_view(
         &cfg,
         selected.as_ref().map(|(a, _)| a),
         bundle.as_deref(),
@@ -269,9 +274,21 @@ fn cmd_once(config_path: &Path) -> Result<()> {
         cwd.as_deref(),
         Some(local_minutes_now()),
     );
+
+    // `matched_rule` is reported here but is not part of PresenceView: see build_policy_view.
+    #[derive(serde::Serialize)]
+    struct OnceOutput<'a> {
+        #[serde(flatten)]
+        view: &'a PresenceView,
+        matched_rule: Option<&'a str>,
+    }
+    let out = OnceOutput {
+        view: &view,
+        matched_rule: policy.matched_rule_name.as_deref(),
+    };
     println!(
         "{}",
-        serde_json::to_string_pretty(&view).context("serialize presence view")?
+        serde_json::to_string_pretty(&out).context("serialize presence view")?
     );
     Ok(())
 }
@@ -426,7 +443,7 @@ fn cmd_detect(config_path: &Path, scope: DetectScope) -> Result<()> {
             agent.id, pid
         );
         let cwd = cwd_basename_for(&sys, &cfg, Some(pid));
-        let view = build_policy_view(
+        let (view, policy) = build_policy_view(
             &cfg,
             Some(&agent),
             bundle.as_deref(),
@@ -436,6 +453,16 @@ fn cmd_detect(config_path: &Path, scope: DetectScope) -> Result<()> {
         );
         println!("  details: {}", view.details);
         println!("  state:   {}", view.state);
+        match policy.matched_rule_name.as_deref() {
+            Some(name) => println!("  matched rule: {name}"),
+            None if cfg.rules.is_empty() => {
+                println!("  matched rule: none (no [[rules]] configured)")
+            }
+            None => println!(
+                "  matched rule: none of the {} configured rules",
+                cfg.rules.len()
+            ),
+        }
     }
     Ok(())
 }
@@ -510,7 +537,7 @@ fn run_daemon(args: RunArgs) -> Result<()> {
     let mut session = PresenceSession::new(cfg.discord.client_id.clone());
     connect_with_wait(&mut session, args.wait_for_discord).context("ipc connect")?;
     info!(config = %args.config.display(), version = env!("CARGO_PKG_VERSION"), "devsignal running");
-    run_loop(cfg, Box::new(DiscordSink::new(session)))
+    run_loop(args.config, cfg, Box::new(DiscordSink::new(session)))
 }
 
 /// Same poll loop as `run`, printing instead of talking to Discord. Useful for seeing what the daemon
@@ -521,10 +548,14 @@ fn cmd_watch(config_path: &Path) -> Result<()> {
         config = %config_path.display(),
         "watch mode: computing presence without connecting to Discord (Ctrl+C to stop)"
     );
-    run_loop(cfg, Box::new(StdoutSink))
+    run_loop(config_path.to_path_buf(), cfg, Box::new(StdoutSink))
 }
 
-fn run_loop(cfg: Config, sink: Box<dyn PresenceSink>) -> Result<()> {
+fn config_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+fn run_loop(config_path: PathBuf, cfg: Config, sink: Box<dyn PresenceSink>) -> Result<()> {
     install_signal_handler();
 
     let poll = Duration::from_secs(cfg.poll_interval_secs.max(1));
@@ -532,6 +563,8 @@ fn run_loop(cfg: Config, sink: Box<dyn PresenceSink>) -> Result<()> {
     let debouncer = Debouncer::new(debounce_min);
 
     let state = RunState {
+        config_mtime: config_mtime(&config_path),
+        config_path,
         cfg,
         sink,
         sys: System::new(),
@@ -546,6 +579,9 @@ fn run_loop(cfg: Config, sink: Box<dyn PresenceSink>) -> Result<()> {
 }
 
 struct RunState {
+    config_path: PathBuf,
+    /// Last-seen modification time, for change detection without a filesystem watcher.
+    config_mtime: Option<SystemTime>,
     cfg: Config,
     sink: Box<dyn PresenceSink>,
     sys: System,
@@ -556,8 +592,48 @@ struct RunState {
     first_tick: bool,
 }
 
+/// Reload the config if the file changed on disk.
+///
+/// Returns true when a new config was applied, so the caller can force a push and make the change
+/// visible immediately. A config that no longer loads is reported and **ignored** — a typo in an edit
+/// must not take down a running daemon.
+fn maybe_reload_config(state: &mut RunState) -> bool {
+    let current = config_mtime(&state.config_path);
+    if current == state.config_mtime {
+        return false;
+    }
+    // Record the new mtime either way, so a persistently invalid file is not re-reported every tick.
+    state.config_mtime = current;
+
+    let next = match Config::load_from_path(&state.config_path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            warn!(
+                error = %format!("{e:#}"),
+                path = %state.config_path.display(),
+                "config changed but does not load; keeping the previous configuration"
+            );
+            return false;
+        }
+    };
+
+    // The Discord connection is bound to the client id at startup; changing it needs a reconnect.
+    if next.discord.client_id != state.cfg.discord.client_id {
+        warn!("discord.client_id changed; restart devsignal for that to take effect");
+    }
+
+    state.poll = Duration::from_secs(next.poll_interval_secs.max(1));
+    state
+        .debouncer
+        .set_min_interval(Duration::from_secs(next.min_push_interval_secs.max(1)));
+    state.cfg = next;
+    info!(path = %state.config_path.display(), "config reloaded");
+    true
+}
+
 fn run_forever(mut state: RunState) {
     while RUNNING.load(Ordering::SeqCst) {
+        let reloaded = maybe_reload_config(&mut state);
         refresh_processes(&mut state.sys, state.cfg.show_cwd_basename);
 
         let candidates = collect_matches(&state.sys, &state.cfg);
@@ -572,7 +648,7 @@ fn run_forever(mut state: RunState) {
         let entered_idle_clear = selected.is_none() && state.cfg.idle_mode == IdleMode::Clear;
 
         if entered_idle_clear {
-            let force = transition || state.first_tick;
+            let force = transition || state.first_tick || reloaded;
             if state.debouncer.should_send(PresenceAction::Clear, force) {
                 debug!("clearing presence (idle_mode = clear)");
                 state.sink.clear();
@@ -603,7 +679,7 @@ fn run_forever(mut state: RunState) {
 
         let bundle = devsignal_macos::frontmost_bundle_id();
 
-        let view = build_policy_view(
+        let (view, policy) = build_policy_view(
             &state.cfg,
             selected.as_ref().map(|(a, _)| a),
             bundle.as_deref(),
@@ -612,12 +688,17 @@ fn run_forever(mut state: RunState) {
             Some(local_minutes_now()),
         );
 
-        let force = transition || state.first_tick;
+        let force = transition || state.first_tick || reloaded;
         if state
             .debouncer
             .should_send(PresenceAction::Set(&view), force)
         {
-            debug!(details = %view.details, state = %view.state, "pushing presence");
+            debug!(
+                details = %view.details,
+                state = %view.state,
+                matched_rule = ?policy.matched_rule_name,
+                "pushing presence"
+            );
             state.sink.set(&view);
         } else if force {
             warn!(
