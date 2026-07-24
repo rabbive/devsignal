@@ -18,6 +18,7 @@ pub enum Cli {
     Validate { config: PathBuf },
     Once { config: PathBuf },
     Detect { config: PathBuf },
+    Watch { config: PathBuf },
     Init { config: PathBuf },
     ConfigEdit(ConfigEditCommand),
     Help,
@@ -43,6 +44,7 @@ pub fn global_help() -> String {
            devsignal validate [-c path]   Parse and check the config, then exit\n\
            devsignal once     [-c path]   Print the presence payload as JSON (no Discord)\n\
            devsignal detect   [-c path]   Show which agent processes match, and which wins\n\
+           devsignal watch    [-c path]   Run the poll loop, printing instead of using Discord\n\
            devsignal hosts  list | enable <bundle_id> | disable <bundle_id>\n\
            devsignal agents list | enable <agent_id>  | disable <agent_id>\n\
            devsignal rules  list | remove <name> | add --name <name> [rule flags]\n\
@@ -154,6 +156,9 @@ pub fn parse_cli(args: &[String]) -> Result<Cli> {
         "detect" => Ok(Cli::Detect {
             config: parse_config_path_only(rest)?,
         }),
+        "watch" => Ok(Cli::Watch {
+            config: parse_config_path_only(rest)?,
+        }),
         "run" => Ok(Cli::Run(parse_run_args(rest)?)),
         "hosts" => Ok(Cli::ConfigEdit(parse_hosts_command(rest)?)),
         "agents" => Ok(Cli::ConfigEdit(parse_agents_command(rest)?)),
@@ -217,13 +222,14 @@ mod tests {
 
     #[test]
     fn subcommands_accept_config_flag() {
-        let cases = ["validate", "once", "detect", "init"];
+        let cases = ["validate", "once", "detect", "watch", "init"];
         for name in cases {
             let cli = parse_cli(&argv(&[name, "--config", "/tmp/x.toml"])).expect("parse");
             let got = match cli {
                 Cli::Validate { config }
                 | Cli::Once { config }
                 | Cli::Detect { config }
+                | Cli::Watch { config }
                 | Cli::Init { config } => config,
                 other => panic!("unexpected variant for {name}: {other:?}"),
             };
@@ -281,5 +287,6 @@ mod tests {
         assert!(global_help().contains("--hide-host"));
         assert!(global_help().contains("--time <HH:MM-HH:MM>"));
         assert!(global_help().contains("detect"));
+        assert!(global_help().contains("watch"));
     }
 }

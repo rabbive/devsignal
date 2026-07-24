@@ -5,7 +5,8 @@ use devsignal_core::{
     process_matches_rule, redact_cwd_basename, select_active_agent, ActiveAgent, AgentRule, Config,
     Debouncer, IdleMode, PresenceView, RuleContext,
 };
-use devsignal_discord::{clear_presence_resilient, set_presence_resilient, PresenceSession};
+use devsignal_discord::PresenceSession;
+use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -16,8 +17,10 @@ mod cli;
 mod config_edit;
 mod config_io;
 mod init;
+mod sink;
 
 use cli::{Cli, RunArgs};
+use sink::{DiscordSink, PresenceSink, StdoutSink};
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
@@ -54,6 +57,22 @@ fn process_refresh_kind(need_cwd: bool) -> ProcessRefreshKind {
         kind.with_cwd(UpdateKind::OnlyIfNotSet)
     } else {
         kind
+    }
+}
+
+/// Sleep, but notice a shutdown signal promptly. `std::thread::sleep` is not interrupted by signal
+/// delivery, so sleeping the whole poll interval in one call meant Ctrl+C took up to that long to be
+/// observed — and `poll_interval_secs` has only a lower bound, so a config with `60` meant a
+/// 60-second shutdown.
+fn sleep_interruptible(total: Duration) {
+    const SLICE: Duration = Duration::from_millis(200);
+    let deadline = Instant::now() + total;
+    while RUNNING.load(Ordering::SeqCst) {
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        std::thread::sleep(SLICE.min(deadline - now));
     }
 }
 
@@ -340,6 +359,11 @@ fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        // Logs on stderr, so stdout carries only machine-readable output: `once`'s JSON and
+        // `watch`'s presence lines stay pipeable.
+        .with_writer(std::io::stderr)
+        // Under launchd, stderr is redirected to a log file; colour escapes there are noise.
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -364,6 +388,7 @@ fn main() {
         Cli::Validate { config } => cmd_validate(&config),
         Cli::Once { config } => cmd_once(&config),
         Cli::Detect { config } => cmd_detect(&config),
+        Cli::Watch { config } => cmd_watch(&config),
         Cli::ConfigEdit(cmd) => config_edit::run_config_edit(cmd),
         Cli::Init { config } => require_macos("init").and_then(|()| init::cmd_init(&config)),
         Cli::Run(args) => require_macos("run").and_then(|()| run_daemon(args)),
@@ -375,31 +400,46 @@ fn main() {
     }
 }
 
-fn run_daemon(args: RunArgs) -> Result<()> {
+fn install_signal_handler() {
     if let Err(e) = ctrlc::set_handler(|| {
         RUNNING.store(false, Ordering::SeqCst);
     }) {
-        // Without a handler we would never clear presence on shutdown, leaving a stale activity
-        // in Discord. Surface it rather than swallowing it.
+        // Without a handler we would never clear presence on shutdown, leaving a stale activity in
+        // Discord. Surface it rather than swallowing it.
         warn!(error = %e, "could not install signal handler; presence may not clear on exit");
     }
+}
 
+fn run_daemon(args: RunArgs) -> Result<()> {
     let cfg = load_config(&args.config)?;
-    let poll = Duration::from_secs(cfg.poll_interval_secs.max(1));
-    let debounce_min = Duration::from_secs(cfg.min_push_interval_secs.max(1));
-
     let mut session = PresenceSession::new(cfg.discord.client_id.clone());
     connect_with_wait(&mut session, args.wait_for_discord).context("ipc connect")?;
-
-    let sys = System::new();
-    let debouncer = Debouncer::new(debounce_min);
-
     info!(config = %args.config.display(), version = env!("CARGO_PKG_VERSION"), "devsignal running");
+    run_loop(cfg, Box::new(DiscordSink::new(session)))
+}
+
+/// Same poll loop as `run`, printing instead of talking to Discord. Useful for seeing what the daemon
+/// would publish, and it is how the shutdown path is tested without a Discord client.
+fn cmd_watch(config_path: &Path) -> Result<()> {
+    let cfg = load_config(config_path)?;
+    info!(
+        config = %config_path.display(),
+        "watch mode: computing presence without connecting to Discord (Ctrl+C to stop)"
+    );
+    run_loop(cfg, Box::new(StdoutSink))
+}
+
+fn run_loop(cfg: Config, sink: Box<dyn PresenceSink>) -> Result<()> {
+    install_signal_handler();
+
+    let poll = Duration::from_secs(cfg.poll_interval_secs.max(1));
+    let debounce_min = Duration::from_secs(cfg.min_push_interval_secs.max(1));
+    let debouncer = Debouncer::new(debounce_min);
 
     let state = RunState {
         cfg,
-        session,
-        sys,
+        sink,
+        sys: System::new(),
         debouncer,
         last_agent_id: None,
         session_start_unix: None,
@@ -412,7 +452,7 @@ fn run_daemon(args: RunArgs) -> Result<()> {
 
 struct RunState {
     cfg: Config,
-    session: PresenceSession,
+    sink: Box<dyn PresenceSink>,
     sys: System,
     debouncer: Debouncer,
     last_agent_id: Option<String>,
@@ -438,14 +478,14 @@ fn run_forever(mut state: RunState) {
 
         if entered_idle_clear {
             if transition || state.first_tick {
-                clear_presence_resilient(&mut state.session);
+                state.sink.clear();
             }
             if transition {
                 state.session_start_unix = None;
                 state.last_agent_id = agent_id;
             }
             state.first_tick = false;
-            std::thread::sleep(state.poll);
+            sleep_interruptible(state.poll);
             continue;
         }
 
@@ -474,14 +514,15 @@ fn run_forever(mut state: RunState) {
         let force = transition || state.first_tick;
         if state.debouncer.should_push(&view, force) {
             debug!(details = %view.details, state = %view.state, "pushing presence");
-            set_presence_resilient(&mut state.session, &view);
+            state.sink.set(&view);
         }
 
         state.first_tick = false;
-        std::thread::sleep(state.poll);
+        sleep_interruptible(state.poll);
     }
 
-    clear_presence_resilient(&mut state.session);
+    // The whole point of trapping SIGTERM: never leave a stale activity behind.
+    state.sink.clear();
 }
 
 #[cfg(test)]
