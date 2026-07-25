@@ -3,21 +3,24 @@ use chrono::Timelike;
 use devsignal_core::{
     agent_allowed, apply_rules, build_presence_view, host_allowed, host_label_for_bundle,
     process_matches_rule, redact_cwd_basename, select_active_agent, ActiveAgent, AgentRule, Config,
-    Debouncer, IdleMode, PresenceView, RuleContext,
+    Debouncer, IdleMode, PresenceAction, PresencePolicyOverride, PresenceView, RuleContext,
 };
-use devsignal_discord::{clear_presence_resilient, set_presence_resilient, PresenceSession};
-use std::path::Path;
+use devsignal_discord::PresenceSession;
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System, UpdateKind};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use tracing::{debug, info, warn};
 
 mod cli;
 mod config_edit;
 mod config_io;
 mod init;
+mod sink;
 
-use cli::{Cli, RunArgs};
+use cli::{Cli, DetectScope, RunArgs};
+use sink::{DiscordSink, PresenceSink, StdoutSink};
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
@@ -57,8 +60,30 @@ fn process_refresh_kind(need_cwd: bool) -> ProcessRefreshKind {
     }
 }
 
+/// Sleep, but notice a shutdown signal promptly. `std::thread::sleep` is not interrupted by signal
+/// delivery, so sleeping the whole poll interval in one call meant Ctrl+C took up to that long to be
+/// observed — and `poll_interval_secs` has only a lower bound, so a config with `60` meant a
+/// 60-second shutdown.
+fn sleep_interruptible(total: Duration) {
+    const SLICE: Duration = Duration::from_millis(200);
+    let deadline = Instant::now() + total;
+    while RUNNING.load(Ordering::SeqCst) {
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        std::thread::sleep(SLICE.min(deadline - now));
+    }
+}
+
+/// Refresh the process table, **removing processes that have exited**.
+///
+/// `System::refresh_specifics` internally passes `remove_dead_processes: false`, so exited processes
+/// stayed in the snapshot forever. Once an agent CLI had been seen it matched for the rest of the
+/// daemon's life: presence kept showing an agent you had quit, `idle_mode = "clear"` never fired, and
+/// the session timer never reset. Call the explicit form so the second argument is visible.
 fn refresh_processes(sys: &mut System, need_cwd: bool) {
-    sys.refresh_specifics(RefreshKind::nothing().with_processes(process_refresh_kind(need_cwd)));
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, process_refresh_kind(need_cwd));
 }
 
 /// One process that satisfied one agent rule.
@@ -106,6 +131,11 @@ fn winner_of(candidates: &[Candidate]) -> Option<(ActiveAgent, u32)> {
     )
 }
 
+/// Build the payload, and report which `[[rules]]` entry (if any) shaped it.
+///
+/// The rule name is returned separately rather than added to `PresenceView`, because that struct is
+/// the debouncer's equality key: including it would trigger a Discord write whenever the matched rule
+/// changed, even with identical visible text.
 fn build_policy_view(
     cfg: &Config,
     agent: Option<&ActiveAgent>,
@@ -113,7 +143,7 @@ fn build_policy_view(
     session_start_unix: Option<u64>,
     cwd_basename: Option<&str>,
     local_minutes: Option<u16>,
-) -> PresenceView {
+) -> (PresenceView, PresencePolicyOverride) {
     let host_is_allowed = host_allowed(cfg, host_bundle_id);
     let ctx = RuleContext {
         host_bundle_id,
@@ -130,10 +160,10 @@ fn build_policy_view(
     if hide_host && policy.state.is_none() {
         view.state = hidden_host_state(agent.is_some(), cwd_basename);
     }
-    if let Some(state) = policy.state {
+    if let Some(state) = policy.state.clone() {
         view.state = state;
     }
-    view
+    (view, policy)
 }
 
 /// Resolve the project basename for the winning PID, when the config asks for it.
@@ -236,7 +266,7 @@ fn cmd_once(config_path: &Path) -> Result<()> {
     // Resolve the CWD exactly as `run` does, so a rule using `when.project_basenames` behaves the
     // same here as in the daemon.
     let cwd = cwd_basename_for(&sys, &cfg, selected.as_ref().map(|(_, pid)| *pid));
-    let view = build_policy_view(
+    let (view, policy) = build_policy_view(
         &cfg,
         selected.as_ref().map(|(a, _)| a),
         bundle.as_deref(),
@@ -244,19 +274,120 @@ fn cmd_once(config_path: &Path) -> Result<()> {
         cwd.as_deref(),
         Some(local_minutes_now()),
     );
+
+    // `matched_rule` is reported here but is not part of PresenceView: see build_policy_view.
+    #[derive(serde::Serialize)]
+    struct OnceOutput<'a> {
+        #[serde(flatten)]
+        view: &'a PresenceView,
+        matched_rule: Option<&'a str>,
+    }
+    let out = OnceOutput {
+        view: &view,
+        matched_rule: policy.matched_rule_name.as_deref(),
+    };
     println!(
         "{}",
-        serde_json::to_string_pretty(&view).context("serialize presence view")?
+        serde_json::to_string_pretty(&out).context("serialize presence view")?
     );
     Ok(())
 }
 
+/// Does this argv[0] look like something a user installed, rather than an OS daemon? Used to keep
+/// `detect --unmatched` readable: a Mac has hundreds of processes and almost none are agent CLIs.
+/// Deliberately generous — `--all` exists for when this filters out the thing you are looking for.
+fn looks_user_installed(argv0: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "/bin/",
+        "/homebrew/",
+        "/.local/",
+        "/.cargo/",
+        "/.bun/",
+        "/.deno/",
+        "/.volta/",
+        "/node_modules/.bin/",
+        "/.npm-global/",
+        "/.pyenv/",
+        "/.rbenv/",
+        "/pipx/",
+        "/.nvm/",
+    ];
+    // Bare names (no path at all) are worth showing: that is how a shim on PATH often appears.
+    if !argv0.contains('/') {
+        return true;
+    }
+    MARKERS.iter().any(|m| argv0.contains(m))
+}
+
+/// List processes that matched no agent rule — the discovery step for adding an agent whose process
+/// name you do not know yet.
+fn print_unmatched(sys: &System, cfg: &Config, unfiltered: bool) {
+    let matched: Vec<u32> = collect_matches(sys, cfg).iter().map(|c| c.pid).collect();
+
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for (pid, proc) in sys.processes() {
+        if proc.thread_kind().is_some() || matched.contains(&pid.as_u32()) {
+            continue;
+        }
+        let name = proc.name().to_string_lossy().to_string();
+        let argv0 = proc
+            .cmd()
+            .first()
+            .map(|a| a.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !unfiltered && !looks_user_installed(&argv0) {
+            continue;
+        }
+        rows.push((name, argv0));
+    }
+    rows.sort();
+    rows.dedup();
+
+    if rows.is_empty() {
+        println!("\nno unmatched processes to show.");
+        if !unfiltered {
+            println!("Try `devsignal detect --all` to list every process.");
+        }
+        return;
+    }
+
+    println!(
+        "\n{} unmatched process(es){}:",
+        rows.len(),
+        if unfiltered {
+            ""
+        } else {
+            " that look user-installed"
+        }
+    );
+    for (name, argv0) in &rows {
+        println!(
+            "  {:<24} argv0={}",
+            name,
+            if argv0.is_empty() { "<none>" } else { argv0 }
+        );
+    }
+    println!(
+        "\nTo track one of these:\n  \
+         devsignal agents add --id <id> --label \"<Label>\" --process-name <name>\n\
+         Matching is case-insensitive against the process name or the basename of argv0."
+    );
+    if !unfiltered {
+        println!("Not listed? `devsignal detect --all` skips the user-installed filter.");
+    }
+}
+
 /// Show every process that matched an agent rule, plus which one wins. This is the tool for
 /// answering "why isn't my agent detected?" — `agents list` only shows *configured* agents.
-fn cmd_detect(config_path: &Path) -> Result<()> {
+fn cmd_detect(config_path: &Path, scope: DetectScope) -> Result<()> {
     let cfg = load_config(config_path)?;
     let mut sys = System::new();
     refresh_processes(&mut sys, cfg.show_cwd_basename);
+
+    if let DetectScope::Unmatched | DetectScope::All = scope {
+        print_unmatched(&sys, &cfg, scope == DetectScope::All);
+        return Ok(());
+    }
 
     let bundle = devsignal_macos::frontmost_bundle_id();
     match &bundle {
@@ -312,7 +443,7 @@ fn cmd_detect(config_path: &Path) -> Result<()> {
             agent.id, pid
         );
         let cwd = cwd_basename_for(&sys, &cfg, Some(pid));
-        let view = build_policy_view(
+        let (view, policy) = build_policy_view(
             &cfg,
             Some(&agent),
             bundle.as_deref(),
@@ -322,6 +453,16 @@ fn cmd_detect(config_path: &Path) -> Result<()> {
         );
         println!("  details: {}", view.details);
         println!("  state:   {}", view.state);
+        match policy.matched_rule_name.as_deref() {
+            Some(name) => println!("  matched rule: {name}"),
+            None if cfg.rules.is_empty() => {
+                println!("  matched rule: none (no [[rules]] configured)")
+            }
+            None => println!(
+                "  matched rule: none of the {} configured rules",
+                cfg.rules.len()
+            ),
+        }
     }
     Ok(())
 }
@@ -340,6 +481,11 @@ fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        // Logs on stderr, so stdout carries only machine-readable output: `once`'s JSON and
+        // `watch`'s presence lines stay pipeable.
+        .with_writer(std::io::stderr)
+        // Under launchd, stderr is redirected to a log file; colour escapes there are noise.
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -363,7 +509,8 @@ fn main() {
         }
         Cli::Validate { config } => cmd_validate(&config),
         Cli::Once { config } => cmd_once(&config),
-        Cli::Detect { config } => cmd_detect(&config),
+        Cli::Detect { config, scope } => cmd_detect(&config, scope),
+        Cli::Watch { config } => cmd_watch(&config),
         Cli::ConfigEdit(cmd) => config_edit::run_config_edit(cmd),
         Cli::Init { config } => require_macos("init").and_then(|()| init::cmd_init(&config)),
         Cli::Run(args) => require_macos("run").and_then(|()| run_daemon(args)),
@@ -375,31 +522,52 @@ fn main() {
     }
 }
 
-fn run_daemon(args: RunArgs) -> Result<()> {
+fn install_signal_handler() {
     if let Err(e) = ctrlc::set_handler(|| {
         RUNNING.store(false, Ordering::SeqCst);
     }) {
-        // Without a handler we would never clear presence on shutdown, leaving a stale activity
-        // in Discord. Surface it rather than swallowing it.
+        // Without a handler we would never clear presence on shutdown, leaving a stale activity in
+        // Discord. Surface it rather than swallowing it.
         warn!(error = %e, "could not install signal handler; presence may not clear on exit");
     }
+}
 
+fn run_daemon(args: RunArgs) -> Result<()> {
     let cfg = load_config(&args.config)?;
-    let poll = Duration::from_secs(cfg.poll_interval_secs.max(1));
-    let debounce_min = Duration::from_secs(cfg.min_push_interval_secs.max(1));
-
     let mut session = PresenceSession::new(cfg.discord.client_id.clone());
     connect_with_wait(&mut session, args.wait_for_discord).context("ipc connect")?;
+    info!(config = %args.config.display(), version = env!("CARGO_PKG_VERSION"), "devsignal running");
+    run_loop(args.config, cfg, Box::new(DiscordSink::new(session)))
+}
 
-    let sys = System::new();
+/// Same poll loop as `run`, printing instead of talking to Discord. Useful for seeing what the daemon
+/// would publish, and it is how the shutdown path is tested without a Discord client.
+fn cmd_watch(config_path: &Path) -> Result<()> {
+    let cfg = load_config(config_path)?;
+    info!(
+        config = %config_path.display(),
+        "watch mode: computing presence without connecting to Discord (Ctrl+C to stop)"
+    );
+    run_loop(config_path.to_path_buf(), cfg, Box::new(StdoutSink))
+}
+
+fn config_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+fn run_loop(config_path: PathBuf, cfg: Config, sink: Box<dyn PresenceSink>) -> Result<()> {
+    install_signal_handler();
+
+    let poll = Duration::from_secs(cfg.poll_interval_secs.max(1));
+    let debounce_min = Duration::from_secs(cfg.min_push_interval_secs.max(1));
     let debouncer = Debouncer::new(debounce_min);
 
-    info!(config = %args.config.display(), version = env!("CARGO_PKG_VERSION"), "devsignal running");
-
     let state = RunState {
+        config_mtime: config_mtime(&config_path),
+        config_path,
         cfg,
-        session,
-        sys,
+        sink,
+        sys: System::new(),
         debouncer,
         last_agent_id: None,
         session_start_unix: None,
@@ -411,8 +579,11 @@ fn run_daemon(args: RunArgs) -> Result<()> {
 }
 
 struct RunState {
+    config_path: PathBuf,
+    /// Last-seen modification time, for change detection without a filesystem watcher.
+    config_mtime: Option<SystemTime>,
     cfg: Config,
-    session: PresenceSession,
+    sink: Box<dyn PresenceSink>,
     sys: System,
     debouncer: Debouncer,
     last_agent_id: Option<String>,
@@ -421,8 +592,48 @@ struct RunState {
     first_tick: bool,
 }
 
+/// Reload the config if the file changed on disk.
+///
+/// Returns true when a new config was applied, so the caller can force a push and make the change
+/// visible immediately. A config that no longer loads is reported and **ignored** — a typo in an edit
+/// must not take down a running daemon.
+fn maybe_reload_config(state: &mut RunState) -> bool {
+    let current = config_mtime(&state.config_path);
+    if current == state.config_mtime {
+        return false;
+    }
+    // Record the new mtime either way, so a persistently invalid file is not re-reported every tick.
+    state.config_mtime = current;
+
+    let next = match Config::load_from_path(&state.config_path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            warn!(
+                error = %format!("{e:#}"),
+                path = %state.config_path.display(),
+                "config changed but does not load; keeping the previous configuration"
+            );
+            return false;
+        }
+    };
+
+    // The Discord connection is bound to the client id at startup; changing it needs a reconnect.
+    if next.discord.client_id != state.cfg.discord.client_id {
+        warn!("discord.client_id changed; restart devsignal for that to take effect");
+    }
+
+    state.poll = Duration::from_secs(next.poll_interval_secs.max(1));
+    state
+        .debouncer
+        .set_min_interval(Duration::from_secs(next.min_push_interval_secs.max(1)));
+    state.cfg = next;
+    info!(path = %state.config_path.display(), "config reloaded");
+    true
+}
+
 fn run_forever(mut state: RunState) {
     while RUNNING.load(Ordering::SeqCst) {
+        let reloaded = maybe_reload_config(&mut state);
         refresh_processes(&mut state.sys, state.cfg.show_cwd_basename);
 
         let candidates = collect_matches(&state.sys, &state.cfg);
@@ -437,15 +648,21 @@ fn run_forever(mut state: RunState) {
         let entered_idle_clear = selected.is_none() && state.cfg.idle_mode == IdleMode::Clear;
 
         if entered_idle_clear {
-            if transition || state.first_tick {
-                clear_presence_resilient(&mut state.session);
+            let force = transition || state.first_tick || reloaded;
+            if state.debouncer.should_send(PresenceAction::Clear, force) {
+                debug!("clearing presence (idle_mode = clear)");
+                state.sink.clear();
+            } else if force {
+                // A refused *forced* send can only be the rate limit: force already skips the
+                // equality check and the minimum interval.
+                warn!("clear suppressed by the Discord rate limit; is an agent process flapping?");
             }
             if transition {
                 state.session_start_unix = None;
                 state.last_agent_id = agent_id;
             }
             state.first_tick = false;
-            std::thread::sleep(state.poll);
+            sleep_interruptible(state.poll);
             continue;
         }
 
@@ -462,7 +679,7 @@ fn run_forever(mut state: RunState) {
 
         let bundle = devsignal_macos::frontmost_bundle_id();
 
-        let view = build_policy_view(
+        let (view, policy) = build_policy_view(
             &state.cfg,
             selected.as_ref().map(|(a, _)| a),
             bundle.as_deref(),
@@ -471,17 +688,32 @@ fn run_forever(mut state: RunState) {
             Some(local_minutes_now()),
         );
 
-        let force = transition || state.first_tick;
-        if state.debouncer.should_push(&view, force) {
-            debug!(details = %view.details, state = %view.state, "pushing presence");
-            set_presence_resilient(&mut state.session, &view);
+        let force = transition || state.first_tick || reloaded;
+        if state
+            .debouncer
+            .should_send(PresenceAction::Set(&view), force)
+        {
+            debug!(
+                details = %view.details,
+                state = %view.state,
+                matched_rule = ?policy.matched_rule_name,
+                "pushing presence"
+            );
+            state.sink.set(&view);
+        } else if force {
+            warn!(
+                details = %view.details,
+                "presence update suppressed by the Discord rate limit; is an agent process flapping?"
+            );
         }
 
         state.first_tick = false;
-        std::thread::sleep(state.poll);
+        sleep_interruptible(state.poll);
     }
 
-    clear_presence_resilient(&mut state.session);
+    // The one legitimate bypass of the debouncer: shutdown must always clear, rate limit or not.
+    // This is the whole point of trapping SIGTERM.
+    state.sink.clear();
 }
 
 #[cfg(test)]
@@ -510,6 +742,36 @@ mod tests {
         let with_cwd = process_refresh_kind(true);
         assert_eq!(with_cwd.cwd(), UpdateKind::OnlyIfNotSet);
         assert_eq!(with_cwd.environ(), UpdateKind::Never);
+    }
+
+    #[test]
+    fn user_installed_heuristic_accepts_agent_cli_shapes() {
+        // The shapes agent CLIs actually take.
+        for argv0 in [
+            "/opt/homebrew/bin/gemini",
+            "/usr/local/bin/codex",
+            "/Users/me/.local/bin/aider",
+            "/Users/me/.bun/bin/opencode",
+            "/Users/me/.cargo/bin/devsignal",
+            "/Users/me/project/node_modules/.bin/cline",
+            "claude",
+        ] {
+            assert!(looks_user_installed(argv0), "{argv0} should be listed");
+        }
+    }
+
+    #[test]
+    fn user_installed_heuristic_filters_system_daemons() {
+        for argv0 in [
+            "/System/Library/PrivateFrameworks/X.framework/Support/xd",
+            "/usr/libexec/secinitd",
+            "/Applications/Safari.app/Contents/MacOS/Safari",
+        ] {
+            assert!(
+                !looks_user_installed(argv0),
+                "{argv0} should be filtered out"
+            );
+        }
     }
 
     #[test]

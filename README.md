@@ -4,9 +4,11 @@ Unified **Discord Rich Presence** for AI coding CLIs on **macOS**. One daemon, o
 connection: it detects which agent-style tool is running and shows the **frontmost host app**
 (Cursor, VS Code, JetBrains, terminals, etc.).
 
-Ships presets for Claude Code, Codex, Gemini CLI, OpenCode, Amp, Cursor Agent, Copilot CLI,
-Aider, Crush, Qwen Code, Droid, Cline, and Goose — all configurable, and
-`devsignal detect` tells you what your machine actually reports.
+Ships confirmed presets for **Claude Code**, **Codex**, and **OpenCode**. Ten more — Gemini CLI,
+Amp, Cursor Agent, Copilot CLI, Aider, Crush, Qwen Code, Droid, Cline, Goose — are documented as
+opt-in snippets in [docs/community-presets.md](docs/community-presets.md), because their process
+names have not been verified on a real machine and a preset that silently never matches is worse than
+no preset. `devsignal detect --unmatched` tells you what your machine actually reports.
 
 ## Discord application setup
 
@@ -61,11 +63,30 @@ If you prefer not to use the wizard:
 | `devsignal validate --config ~/.config/devsignal/config.toml` | Load and validate config; print agent rules |
 | `devsignal once --config …` | One sample: print the JSON `PresenceView` that `run` would publish (no Discord IPC) |
 | `devsignal detect --config …` | Show every process matching an agent rule, which one wins, and why |
+| `devsignal detect --unmatched` | Running processes no rule matched — how to find an agent's process name |
+| `devsignal watch --config …` | Run the poll loop printing each payload, without touching Discord |
+| `devsignal agents add --id … --process-name …` | Add an agent rule (see community presets) |
+| `devsignal agents remove <id>` | Delete an agent rule |
 | `devsignal --version` | Print the version |
 | `devsignal --help` | Usage, including all `rules add` flags |
 | `devsignal hosts list/enable/disable` | View or change host app visibility by bundle id |
 | `devsignal agents list/enable/disable` | View or change detected AI agent CLIs by agent id |
 | `devsignal rules list/add/remove` | Manage first-match presence rules for custom state / hidden host |
+
+### Adding an agent CLI
+
+Only agents with confirmed process names ship as defaults. To track another one:
+
+```bash
+# 1. Start the agent CLI in another terminal, then:
+devsignal detect --unmatched      # what does this machine actually call it?
+devsignal agents add --id gemini_cli --label "Gemini CLI" --process-name gemini --priority 100
+devsignal detect                  # confirm it is found and wins
+```
+
+[docs/community-presets.md](docs/community-presets.md) has ready-made snippets for ten common CLIs,
+plus the collision caveats for short names like `amp`, `crush`, and `goose`. If you confirm one,
+please open an issue with the `detect` output so it can ship as a default.
 
 ### Releases (prebuilt macOS universal binary)
 

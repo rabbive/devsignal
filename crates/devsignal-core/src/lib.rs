@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 /// Top-level config loaded from `~/.config/devsignal/config.toml` (or `--config`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default = "default_poll_interval_secs")]
     pub poll_interval_secs: u64,
@@ -48,6 +49,7 @@ fn default_min_push_interval_secs() -> u64 {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiscordSection {
     /// Discord Application (Rich Presence) client ID.
     pub client_id: String,
@@ -68,6 +70,7 @@ fn default_large_image() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentRule {
     /// Stable id: `claude_code`, `codex`, `opencode`, ...
     pub id: String,
@@ -106,6 +109,7 @@ pub const MAX_BUTTONS: usize = 2;
 
 /// A Discord Rich Presence button (label + URL). Maximum 2 per presence payload.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ButtonConfig {
     /// Displayed on the button in Discord (1–32 characters).
     pub label: String,
@@ -164,6 +168,7 @@ pub fn parse_numeric_id(raw: &str) -> Result<String> {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlatformsConfig {
     #[serde(default)]
     pub disabled_hosts: Vec<String>,
@@ -172,6 +177,7 @@ pub struct PlatformsConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PresenceRule {
     pub name: String,
     #[serde(default)]
@@ -181,6 +187,7 @@ pub struct PresenceRule {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuleWhen {
     #[serde(default)]
     pub host_bundle_ids: Vec<String>,
@@ -197,6 +204,7 @@ pub struct RuleWhen {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuleThen {
     #[serde(default)]
     pub hide_host: bool,
@@ -205,6 +213,7 @@ pub struct RuleThen {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TimeWindow {
     pub start: String,
     pub end: String,
@@ -219,6 +228,11 @@ pub struct RuleContext<'a> {
     pub local_minutes: Option<u16>,
 }
 
+/// Result of evaluating `[[rules]]`.
+///
+/// `matched_rule_name` is reported to the user by `detect` and `once`. It deliberately does **not**
+/// live on [`PresenceView`]: that struct is the debouncer's equality key, so a rule-name change alone
+/// would trigger a Discord write even when the visible text is identical.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PresencePolicyOverride {
     pub matched_rule_name: Option<String>,
@@ -233,17 +247,14 @@ fn default_priority() -> i32 {
 /// Built-in agent CLI presets — the single source of truth for `devsignal init` and the shipped
 /// `config.example.toml`. Both used to hardcode their own copy, which drifts.
 ///
-/// `process_names` matches the process name **or** the basename of `argv[0]`, case-insensitively,
-/// so Node- and Python-wrapped CLIs are covered without extra entries.
+/// **Only agents whose process names have been confirmed on a real machine live here.** A default
+/// that silently never matches is worse than no default: the daemon looks broken and the user has no
+/// way to tell a wrong `process_names` from "devsignal is not working". Ten further presets ship as
+/// opt-in snippets in `docs/community-presets.md`, to be confirmed with `devsignal detect` and added
+/// with `devsignal agents add`.
 ///
-/// Two caveats worth knowing before trusting a preset:
-///
-/// * **Binary names are best-effort.** These CLIs rename and re-package often. Run
-///   `devsignal detect` while the CLI is running to confirm what your machine actually reports,
-///   and adjust `process_names` in your own config if a preset misses.
-/// * **Some names are generic enough to collide** with unrelated tools (`goose` is also a Go
-///   database-migration tool; `amp` and `crush` are short). A false positive only mislabels the
-///   presence line; `devsignal agents disable <id>` turns any preset off.
+/// `process_names` matches the process name **or** the basename of `argv[0]`, case-insensitively, so
+/// Node- and Python-wrapped CLIs are covered without extra entries.
 ///
 /// `large_image` is a Discord art-asset **key**, not a URL — a key you have not uploaded in the
 /// Developer Portal renders blank. `devsignal init` prints the full list of keys to upload.
@@ -292,40 +303,12 @@ pub fn agent_presets() -> Vec<AgentRule> {
             Some(("Codex on GitHub", "https://github.com/openai/codex")),
         ),
         preset(
-            "gemini_cli",
-            "Gemini CLI",
-            &["gemini"],
-            30,
-            Some(("Gemini CLI", "https://github.com/google-gemini/gemini-cli")),
-        ),
-        preset(
             "opencode",
             "OpenCode",
             &["opencode"],
-            40,
+            30,
             Some(("OpenCode Docs", "https://opencode.ai")),
         ),
-        preset("amp", "Amp", &["amp"], 50, None),
-        preset("cursor_agent", "Cursor Agent", &["cursor-agent"], 60, None),
-        preset("copilot_cli", "Copilot CLI", &["copilot"], 70, None),
-        preset(
-            "aider",
-            "Aider",
-            &["aider"],
-            80,
-            Some(("Aider Docs", "https://aider.chat")),
-        ),
-        preset(
-            "crush",
-            "Crush",
-            &["crush"],
-            90,
-            Some(("Crush on GitHub", "https://github.com/charmbracelet/crush")),
-        ),
-        preset("qwen_code", "Qwen Code", &["qwen"], 100, None),
-        preset("droid", "Droid", &["droid"], 110, None),
-        preset("cline", "Cline", &["cline"], 120, None),
-        preset("goose", "Goose", &["goose"], 130, None),
     ]
 }
 
@@ -495,41 +478,123 @@ pub struct PresenceView {
     pub start_timestamp_unix: Option<u64>,
 }
 
+/// Discord's documented RPC rate limit: 5 activity updates per 20 seconds, per client.
+pub const RATE_LIMIT_MAX_SENDS: usize = 5;
+pub const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(20);
+
+/// What the daemon wants to tell Discord this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresenceAction<'a> {
+    Set(&'a PresenceView),
+    /// `CLEAR_ACTIVITY` — used by `idle_mode = "clear"` and on shutdown.
+    Clear,
+}
+
+/// What the debouncer last told Discord, for equality-based deduplication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LastSent {
+    Set(PresenceView),
+    Clear,
+}
+
 #[derive(Debug, Clone)]
 pub struct Debouncer {
     min_interval: Duration,
-    last_payload: Option<PresenceView>,
+    max_sends: usize,
+    window: Duration,
+    last_sent: Option<LastSent>,
     last_push: Option<Instant>,
+    /// Timestamps of sends inside the current window, oldest first.
+    recent: std::collections::VecDeque<Instant>,
 }
 
 impl Debouncer {
     pub fn new(min_interval: Duration) -> Self {
+        Self::with_limits(min_interval, RATE_LIMIT_MAX_SENDS, RATE_LIMIT_WINDOW)
+    }
+
+    /// Same as [`Debouncer::new`] with the rate-limit window overridden, so tests need not sleep for
+    /// 20 seconds to exercise it.
+    pub fn with_limits(min_interval: Duration, max_sends: usize, window: Duration) -> Self {
         Self {
             min_interval,
-            last_payload: None,
+            max_sends,
+            window,
+            last_sent: None,
             last_push: None,
+            recent: std::collections::VecDeque::new(),
         }
     }
 
-    /// Returns `true` if Discord should be updated now.
-    pub fn should_push(&mut self, next: &PresenceView, force: bool) -> bool {
-        if force {
-            self.last_payload = Some(next.clone());
-            self.last_push = Some(Instant::now());
-            return true;
+    /// Adjust the minimum interval in place. Used by config hot-reload: rebuilding the debouncer
+    /// would discard the dedupe state and the rate-limit window along with it.
+    pub fn set_min_interval(&mut self, min_interval: Duration) {
+        self.min_interval = min_interval;
+    }
+
+    pub fn min_interval(&self) -> Duration {
+        self.min_interval
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while let Some(&front) = self.recent.front() {
+            if now.duration_since(front) >= self.window {
+                self.recent.pop_front();
+            } else {
+                break;
+            }
         }
-        if self.last_payload.as_ref() == Some(next) {
+    }
+
+    /// True when the sliding window is full. Checked even for forced sends: `force` exists to keep
+    /// agent transitions responsive, not to license unbounded IPC traffic.
+    pub fn rate_limited(&mut self, now: Instant) -> bool {
+        self.prune(now);
+        self.recent.len() >= self.max_sends
+    }
+
+    fn record(&mut self, sent: LastSent, now: Instant) {
+        self.last_sent = Some(sent);
+        self.last_push = Some(now);
+        self.recent.push_back(now);
+    }
+
+    /// Whether to send `action` to Discord now.
+    ///
+    /// `force` (an agent transition, or the first tick) skips the equality check and the
+    /// `min_push_interval_secs` wait, but **not** the rate limit. Without that last part, an agent
+    /// process that flaps in and out on alternate polls makes every tick a transition, and the daemon
+    /// writes to Discord every `poll_interval_secs` indefinitely.
+    pub fn should_send(&mut self, action: PresenceAction<'_>, force: bool) -> bool {
+        let now = Instant::now();
+        if self.rate_limited(now) {
             return false;
         }
-        let now = Instant::now();
+
+        let next = match action {
+            PresenceAction::Set(view) => LastSent::Set(view.clone()),
+            PresenceAction::Clear => LastSent::Clear,
+        };
+
+        if force {
+            self.record(next, now);
+            return true;
+        }
+        if self.last_sent.as_ref() == Some(&next) {
+            return false;
+        }
         if let Some(t) = self.last_push {
             if now.duration_since(t) < self.min_interval {
                 return false;
             }
         }
-        self.last_payload = Some(next.clone());
-        self.last_push = Some(now);
+        self.record(next, now);
         true
+    }
+
+    /// Convenience wrapper for the common case.
+    pub fn should_push(&mut self, next: &PresenceView, force: bool) -> bool {
+        self.should_send(PresenceAction::Set(next), force)
     }
 }
 
@@ -1076,10 +1141,19 @@ mod tests {
             .expect("shipped presets must be a valid config");
     }
 
+    /// The shipped table is deliberately limited to agents whose process names have been confirmed on
+    /// a real machine. Adding one here is a claim that it was verified with `devsignal detect`;
+    /// unconfirmed agents belong in `docs/community-presets.md`.
+    #[test]
+    fn shipped_presets_are_the_confirmed_set() {
+        let ids: Vec<String> = agent_presets().into_iter().map(|a| a.id).collect();
+        assert_eq!(ids, vec!["claude_code", "codex", "opencode"]);
+    }
+
     #[test]
     fn presets_have_unique_ids_and_priorities() {
         let presets = agent_presets();
-        assert!(presets.len() >= 10, "expected a broad preset table");
+        assert!(!presets.is_empty(), "at least one preset must ship");
 
         let mut ids: Vec<&str> = presets.iter().map(|a| a.id.as_str()).collect();
         ids.sort_unstable();
@@ -1171,6 +1245,154 @@ mod tests {
                 "config.example.toml has agent {id:?} with no matching preset"
             );
         }
+    }
+
+    /// Extract every ```toml fenced block from a markdown document.
+    fn toml_fences(markdown: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut current: Option<String> = None;
+        for line in markdown.lines() {
+            match (&mut current, line.trim_start()) {
+                (None, l) if l.starts_with("```toml") => current = Some(String::new()),
+                (Some(_), l) if l.starts_with("```") => {
+                    out.push(current.take().expect("in a fence"));
+                }
+                (Some(buf), _) => {
+                    buf.push_str(line);
+                    buf.push('\n');
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// The community presets are unverified *process names* — that is the user's to confirm. A
+    /// snippet that does not even parse, or that violates the config rules, is ours. This stops the
+    /// doc from rotting as validation tightens.
+    #[test]
+    fn community_preset_snippets_are_valid_config() {
+        let doc = include_str!("../../../docs/community-presets.md");
+        let fences = toml_fences(doc);
+        assert!(
+            fences.len() >= 10,
+            "expected a snippet per community preset, found {}",
+            fences.len()
+        );
+
+        let shipped: Vec<String> = agent_presets().into_iter().map(|a| a.id).collect();
+        let mut seen_ids = Vec::new();
+
+        for (idx, fence) in fences.iter().enumerate() {
+            // Each fence is an [[agents]] fragment; give it the minimum surrounding config.
+            let full = format!("[discord]\nclient_id = \"1\"\n\n{fence}");
+            let cfg: Config = toml::from_str(&full)
+                .unwrap_or_else(|e| panic!("snippet {idx} does not parse: {e}\n---\n{fence}"));
+            cfg.validate().unwrap_or_else(|e| {
+                panic!("snippet {idx} is not a valid config: {e:#}\n---\n{fence}")
+            });
+
+            for agent in cfg.agents {
+                // A community preset must not collide with a shipped one, or pasting it in produces a
+                // duplicate-id error the user did not cause.
+                assert!(
+                    !shipped.contains(&agent.id),
+                    "snippet {idx} reuses shipped preset id {:?}",
+                    agent.id
+                );
+                // Priorities must stay clear of the shipped band so ordering is predictable.
+                assert!(
+                    agent.priority >= 100,
+                    "snippet {idx} ({}) uses priority {} — community presets start at 100 to avoid \
+                     colliding with shipped presets",
+                    agent.id,
+                    agent.priority
+                );
+                seen_ids.push(agent.id);
+            }
+        }
+
+        // The button example intentionally repeats an id; ignore duplicates from that section by
+        // checking only that every documented agent id appears at least once.
+        for expected in [
+            "gemini_cli",
+            "amp",
+            "cursor_agent",
+            "copilot_cli",
+            "aider",
+            "crush",
+            "qwen_code",
+            "droid",
+            "cline",
+            "goose",
+        ] {
+            assert!(
+                seen_ids.iter().any(|id| id == expected),
+                "docs/community-presets.md is missing a snippet for {expected}"
+            );
+        }
+    }
+
+    /// A typo'd key used to parse fine and be silently ignored, so the setting simply never applied.
+    #[test]
+    fn unknown_config_keys_are_rejected() {
+        let cases = [
+            // Misspelled top-level key.
+            r#"show_cwd_basemane = true
+               [discord]
+               client_id = "1"
+               [[agents]]
+               id = "a"
+               process_names = ["a"]"#,
+            // Misspelled table name.
+            r#"[discord]
+               client_id = "1"
+               [platform]
+               disabled_hosts = []
+               [[agents]]
+               id = "a"
+               process_names = ["a"]"#,
+            // Misspelled key inside a nested table.
+            r#"[discord]
+               client_id = "1"
+               [platforms]
+               disabled_host = []
+               [[agents]]
+               id = "a"
+               process_names = ["a"]"#,
+            // Misspelled agent field.
+            r#"[discord]
+               client_id = "1"
+               [[agents]]
+               id = "a"
+               process_name = ["a"]"#,
+            // Misspelled rule field.
+            r#"[discord]
+               client_id = "1"
+               [[agents]]
+               id = "a"
+               process_names = ["a"]
+               [[rules]]
+               name = "r"
+               then = { hide_host = true, stat = "x" }"#,
+        ];
+        for (idx, case) in cases.iter().enumerate() {
+            let err = toml::from_str::<Config>(case)
+                .expect_err(&format!("case {idx} should have been rejected"));
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("unknown field"),
+                "case {idx} should name the unknown field, got: {msg}"
+            );
+        }
+    }
+
+    /// The corollary: every key the shipped example uses must still be accepted.
+    #[test]
+    fn the_example_config_has_no_unknown_keys() {
+        let raw = include_str!("../../../config.example.toml");
+        toml::from_str::<Config>(raw)
+            .expect("config.example.toml must parse with deny_unknown_fields");
     }
 
     #[test]
@@ -1321,6 +1543,107 @@ mod tests {
         assert!(!d.should_push(&b, false));
         std::thread::sleep(Duration::from_millis(450));
         assert!(d.should_push(&b, false));
+    }
+
+    fn view_named(details: &str) -> PresenceView {
+        PresenceView {
+            details: details.into(),
+            state: "s".into(),
+            large_image: "x".into(),
+            large_text: String::new(),
+            small_image: None,
+            small_text: None,
+            buttons: vec![],
+            start_timestamp_unix: None,
+        }
+    }
+
+    /// The regression: `force` used to return `true` before any rate check, so a flapping agent
+    /// produced one Discord write per poll tick forever.
+    #[test]
+    fn rate_limit_applies_even_to_forced_sends() {
+        // 3 sends per long window, so the cap is hit deterministically without sleeping.
+        let mut d = Debouncer::with_limits(Duration::from_millis(1), 3, Duration::from_secs(60));
+
+        for i in 0..3 {
+            assert!(
+                d.should_push(&view_named(&format!("v{i}")), true),
+                "send {i} should be allowed"
+            );
+        }
+        // Cap reached: further forced sends are refused despite `force`.
+        assert!(!d.should_push(&view_named("v3"), true));
+        assert!(!d.should_push(&view_named("v4"), true));
+        // And a non-forced one too.
+        assert!(!d.should_push(&view_named("v5"), false));
+    }
+
+    #[test]
+    fn rate_limit_window_slides() {
+        let mut d = Debouncer::with_limits(Duration::from_millis(1), 2, Duration::from_millis(300));
+        assert!(d.should_push(&view_named("a"), true));
+        assert!(d.should_push(&view_named("b"), true));
+        assert!(!d.should_push(&view_named("c"), true), "cap of 2 reached");
+
+        // Once the window rolls past the earlier sends, capacity returns.
+        std::thread::sleep(Duration::from_millis(350));
+        assert!(d.should_push(&view_named("c"), true));
+    }
+
+    /// `idle_mode = "clear"` used to bypass the debouncer entirely — it was not merely exempt from
+    /// the rate limit, it never consulted it.
+    #[test]
+    fn clears_go_through_the_same_limiter_as_sets() {
+        let mut d = Debouncer::with_limits(Duration::from_millis(1), 2, Duration::from_secs(60));
+        assert!(d.should_send(PresenceAction::Clear, true));
+        assert!(d.should_send(PresenceAction::Clear, true));
+        assert!(
+            !d.should_send(PresenceAction::Clear, true),
+            "clears must consume rate-limit budget too"
+        );
+    }
+
+    #[test]
+    fn a_repeated_clear_is_deduplicated() {
+        let mut d = Debouncer::with_limits(Duration::from_millis(1), 10, Duration::from_secs(60));
+        assert!(d.should_send(PresenceAction::Clear, false));
+        assert!(
+            !d.should_send(PresenceAction::Clear, false),
+            "an unchanged clear should not be resent"
+        );
+    }
+
+    /// Set-then-clear-then-set must not be deduplicated away: the actions differ.
+    #[test]
+    fn alternating_set_and_clear_are_distinct_payloads() {
+        let mut d = Debouncer::with_limits(Duration::ZERO, 10, Duration::from_secs(60));
+        let v = view_named("a");
+        assert!(d.should_send(PresenceAction::Set(&v), false));
+        assert!(d.should_send(PresenceAction::Clear, false));
+        assert!(d.should_send(PresenceAction::Set(&v), false));
+    }
+
+    #[test]
+    fn set_min_interval_preserves_dedupe_and_window_state() {
+        let mut d = Debouncer::with_limits(Duration::from_secs(60), 5, Duration::from_secs(60));
+        let v = view_named("a");
+        assert!(d.should_push(&v, true));
+        assert_eq!(d.min_interval(), Duration::from_secs(60));
+
+        // Hot-reload lowering the interval must not forget what was already sent.
+        d.set_min_interval(Duration::ZERO);
+        assert_eq!(d.min_interval(), Duration::ZERO);
+        assert!(
+            !d.should_push(&v, false),
+            "the identical payload should still be deduplicated after a reload"
+        );
+        assert!(d.should_push(&view_named("b"), false));
+    }
+
+    #[test]
+    fn default_limits_match_discords_documented_rate() {
+        assert_eq!(RATE_LIMIT_MAX_SENDS, 5);
+        assert_eq!(RATE_LIMIT_WINDOW, Duration::from_secs(20));
     }
 
     #[test]

@@ -10,7 +10,7 @@ show_cwd_basename      = false     # Show the basename of the agent's working di
 [platforms]
 # All known host apps and agents are enabled by default. Add ids here to hide/ignore them.
 disabled_hosts  = [] # e.g. ["com.todesktop.230313mzl4w4u92"] to hide Cursor as a host label.
-disabled_agents = [] # e.g. ["goose"] to ignore that agent rule.
+disabled_agents = [] # e.g. ["opencode"] to ignore that agent rule.
 
 [discord]
 # Your Discord Application ID from https://discord.com/developers/applications
@@ -32,10 +32,12 @@ large_text  = "devsignal"   # Hover tooltip for the idle large image.
 #                  uploaded renders blank — delete the line to fall back to "devsignal".
 # buttons:         up to 2 clickable buttons. More than 2 is rejected at load.
 #
-# Binary names below are best-effort: these CLIs rename and re-package often. Run
-# `devsignal detect` while your agent is running to see what your machine actually
-# reports, then adjust process_names here. Short names like "amp", "crush", and "goose"
-# can collide with unrelated tools — `devsignal agents disable <id>` turns one off.
+# Only agents with confirmed process names ship here. For Gemini CLI, Amp, Cursor Agent,
+# Copilot CLI, Aider, Crush, Qwen Code, Droid, Cline, and Goose, see docs/community-presets.md
+# — those names are unconfirmed, so the workflow is:
+#     1. start your agent CLI
+#     2. devsignal detect --unmatched      # find what your machine actually reports
+#     3. devsignal agents add --id <id> --process-name <name> --label "<Label>"
 
 [[agents]]
 id            = "claude_code"
@@ -64,23 +66,10 @@ small_text    = "devsignal"
   url   = "https://github.com/openai/codex"
 
 [[agents]]
-id            = "gemini_cli"
-label         = "Gemini CLI"
-process_names = ["gemini"]
-priority      = 30
-large_image   = "gemini_cli"
-small_image   = "devsignal"
-small_text    = "devsignal"
-
-  [[agents.buttons]]
-  label = "Gemini CLI"
-  url   = "https://github.com/google-gemini/gemini-cli"
-
-[[agents]]
 id            = "opencode"
 label         = "OpenCode"
 process_names = ["opencode"]
-priority      = 40
+priority      = 30
 large_image   = "opencode"
 small_image   = "devsignal"
 small_text    = "devsignal"
@@ -88,95 +77,6 @@ small_text    = "devsignal"
   [[agents.buttons]]
   label = "OpenCode Docs"
   url   = "https://opencode.ai"
-
-[[agents]]
-id            = "amp"
-label         = "Amp"
-process_names = ["amp"]
-priority      = 50
-large_image   = "amp"
-small_image   = "devsignal"
-small_text    = "devsignal"
-
-[[agents]]
-id            = "cursor_agent"
-label         = "Cursor Agent"
-process_names = ["cursor-agent"]
-priority      = 60
-large_image   = "cursor_agent"
-small_image   = "devsignal"
-small_text    = "devsignal"
-
-[[agents]]
-id            = "copilot_cli"
-label         = "Copilot CLI"
-process_names = ["copilot"]
-priority      = 70
-large_image   = "copilot_cli"
-small_image   = "devsignal"
-small_text    = "devsignal"
-
-[[agents]]
-id            = "aider"
-label         = "Aider"
-process_names = ["aider"]
-priority      = 80
-large_image   = "aider"
-small_image   = "devsignal"
-small_text    = "devsignal"
-
-  [[agents.buttons]]
-  label = "Aider Docs"
-  url   = "https://aider.chat"
-
-[[agents]]
-id            = "crush"
-label         = "Crush"
-process_names = ["crush"]
-priority      = 90
-large_image   = "crush"
-small_image   = "devsignal"
-small_text    = "devsignal"
-
-  [[agents.buttons]]
-  label = "Crush on GitHub"
-  url   = "https://github.com/charmbracelet/crush"
-
-[[agents]]
-id            = "qwen_code"
-label         = "Qwen Code"
-process_names = ["qwen"]
-priority      = 100
-large_image   = "qwen_code"
-small_image   = "devsignal"
-small_text    = "devsignal"
-
-[[agents]]
-id            = "droid"
-label         = "Droid"
-process_names = ["droid"]
-priority      = 110
-large_image   = "droid"
-small_image   = "devsignal"
-small_text    = "devsignal"
-
-[[agents]]
-id            = "cline"
-label         = "Cline"
-process_names = ["cline"]
-priority      = 120
-large_image   = "cline"
-small_image   = "devsignal"
-small_text    = "devsignal"
-
-[[agents]]
-id            = "goose"
-label         = "Goose"
-process_names = ["goose"]
-priority      = 130
-large_image   = "goose"
-small_image   = "devsignal"
-small_text    = "devsignal"
 
 # ── Presence rules (optional) ──────────────────────────────────────────────────
 # First match wins, evaluated in file order. `when` fields are ANDed; within a

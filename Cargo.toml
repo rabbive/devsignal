@@ -11,7 +11,11 @@ members = [
 version = "0.3.0"
 edition = "2021"
 license = "MIT"
-rust-version = "1.74"
+# Verified empirically, not guessed: 1.86 and below fail to build. The floor comes from the
+# dependency graph (discord-rich-presence 1.1 uses the inherent `str::from_utf8`, stable in 1.87;
+# indexmap 2.14 needs edition2024) as well as `Option::is_none_or` in devsignal-core.
+# The `msrv` CI job pins this exact version so the claim cannot drift again.
+rust-version = "1.87"
 
 [workspace.dependencies]
 anyhow = "1"
