@@ -1,7 +1,8 @@
 # Community agent presets
 
 devsignal ships presets only for agent CLIs whose process names have been **confirmed on a real
-machine**: Claude Code, Codex, and OpenCode. Everything below is a plausible-but-unconfirmed guess.
+machine**: Claude Code, Codex, OpenCode, and Cursor Agent. Everything below is a
+plausible-but-unconfirmed guess, except Cline — which was confirmed *wrong* and corrected below.
 
 That distinction matters. A preset with a wrong `process_names` does not fail loudly — it simply never
 matches, and devsignal looks broken with no way to tell the difference. So these live here, as
@@ -36,7 +37,7 @@ extra configuration.
 ## Snippets
 
 Paste any of these into the `[[agents]]` section of `~/.config/devsignal/config.toml`. Priorities
-start at 100 so they never collide with the shipped presets (10, 20, 30) — lower wins when more than
+start at 100 so they never collide with the shipped presets (10, 20, 30, 40) — lower wins when more than
 one agent is running.
 
 `large_image` is a Discord art-asset **key**, not a URL. A key you have not uploaded under
@@ -66,17 +67,6 @@ label         = "Amp"
 process_names = ["amp"]
 priority      = 110
 large_image   = "amp"
-```
-
-### Cursor Agent
-
-```toml
-[[agents]]
-id            = "cursor_agent"
-label         = "Cursor Agent"
-process_names = ["cursor-agent"]
-priority      = 120
-large_image   = "cursor_agent"
 ```
 
 ### Copilot CLI
@@ -140,11 +130,23 @@ large_image   = "droid"
 
 ### Cline
 
+**Corrected after testing, and use with care.** `cline` on `PATH` is a Node resolver script that
+*spawns* the real binary rather than exec'ing it, so two processes exist and **neither is called
+`cline`**: the resolver is `node` with `argv[0] = node`, and the binary it launches is named
+`.cline` — with a leading dot. Matching is exact string equality on the name or the argv[0]
+basename, so `process_names = ["cline"]` never matches anything. Use `.cline`.
+
+**False-positive warning:** Cline also leaves a `.cline --cline-hub-daemon …` process running in the
+background after you stop using the CLI. Because `argv_substrings` can only *include*, there is no
+way to match the CLI while excluding the daemon — so this preset will show "Cline" whenever that
+daemon is alive. That is why it is not shipped as a default. Disable it with
+`devsignal agents disable cline` when it misfires.
+
 ```toml
 [[agents]]
 id            = "cline"
 label         = "Cline"
-process_names = ["cline"]
+process_names = [".cline"]
 priority      = 180
 large_image   = "cline"
 ```
