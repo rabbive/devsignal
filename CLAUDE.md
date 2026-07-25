@@ -266,6 +266,10 @@ host apps there, with a test asserting the entry when it matters. Unknown bundle
   `feat(init):`).
 - `docs/superpowers/plans/` holds dated design plans for larger features; `README.md` carries the
   user-facing architecture and install docs and should be kept in sync with structural changes.
+- `docs/handoff-v0.3.0.md` is the current release-state handoff: what is done, what is still
+  **unverified** (community preset process names, the real launchd → Discord check, signing), and the
+  ordered steps to tag v0.3.0. Read it before assuming any of that is finished; delete it once the
+  release is out and its open items are closed.
 
 ## Learned preferences
 
