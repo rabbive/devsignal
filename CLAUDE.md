@@ -266,10 +266,23 @@ host apps there, with a test asserting the entry when it matters. Unknown bundle
   `feat(init):`).
 - `docs/superpowers/plans/` holds dated design plans for larger features; `README.md` carries the
   user-facing architecture and install docs and should be kept in sync with structural changes.
-- `docs/handoff-v0.3.0.md` is the current release-state handoff: what is done, what is still
-  **unverified** (community preset process names, the real launchd → Discord check, signing), and the
-  ordered steps to tag v0.3.0. Read it before assuming any of that is finished; delete it once the
-  release is out and its open items are closed.
+- v0.3.0 is merged but **not tagged** — `Cargo.toml` says `0.3.0`, `CHANGELOG.md` still says
+  `unreleased`, and the newest tag is `v0.2.0`. Four things are **unverified** because each needs a
+  Mac or the maintainer's Apple credentials, and none should be assumed done:
+  1. The ten process names in `docs/community-presets.md` are inferred and have never been run.
+     Confirm with `devsignal detect --unmatched` while each CLI is running, then promote into
+     `agent_presets()` **and** `config.example.toml` — the drift test fails if only one is updated.
+  2. The real launchd → Discord loop: `init` → LaunchAgent loaded → presence appears →
+     `launchctl bootout gui/$(id -u)/com.devsignal.daemon` → presence clears in the actual client.
+  3. Signing and notarization have never executed. They need five repo secrets —
+     `APPLE_CERT_P12_BASE64`, `APPLE_CERT_PASSWORD`, `APPLE_NOTARY_API_KEY`, `APPLE_NOTARY_KEY_ID`,
+     `APPLE_NOTARY_ISSUER_ID` — all five or none, since a partial set is a hard error by design. Use
+     the release workflow's `workflow_dispatch` trigger to dry-run the whole pipeline first, so the
+     first real tag is not also signing's first execution.
+  4. `install.sh` against a real v0.3.0 release, including the Gatekeeper path.
+
+  Then date the `CHANGELOG.md` heading and tag. The release workflow fails if the tag disagrees with
+  `Cargo.toml`, so bump both together.
 
 ## Learned preferences
 
