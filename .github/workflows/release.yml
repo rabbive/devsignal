@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - "v*"
+  # Exercises the whole build/sign/checksum path without cutting a tag: the signing steps had never
+  # run before a real release, which made the first tag their first execution. Always a dry run —
+  # publishing requires a tag, so nothing is uploaded on this trigger.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -23,16 +27,29 @@ jobs:
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
-      # A tag that disagrees with Cargo.toml produces an artifact whose --version lies.
-      - name: Check tag matches crate version
+      # The artifact is always named from Cargo.toml, never from the ref: on workflow_dispatch the
+      # ref is a branch name, which may contain slashes. On a tag push the two must agree, or the
+      # published binary's --version would contradict its filename.
+      - name: Resolve version
+        id: version
         run: |
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
           # [workspace.package] version is the single definition all crates inherit.
           CRATE_VERSION="$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
-          echo "tag=${TAG_VERSION} crate=${CRATE_VERSION}"
-          if [[ "$TAG_VERSION" != "$CRATE_VERSION" ]]; then
-            echo "::error::tag v${TAG_VERSION} does not match Cargo.toml version ${CRATE_VERSION}"
+          if [[ -z "$CRATE_VERSION" ]]; then
+            echo "::error::could not read version from Cargo.toml"
             exit 1
+          fi
+          echo "value=${CRATE_VERSION}" >> "$GITHUB_OUTPUT"
+
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            echo "tag=${TAG_VERSION} crate=${CRATE_VERSION}"
+            if [[ "$TAG_VERSION" != "$CRATE_VERSION" ]]; then
+              echo "::error::tag v${TAG_VERSION} does not match Cargo.toml version ${CRATE_VERSION}"
+              exit 1
+            fi
+          else
+            echo "dry run for version ${CRATE_VERSION} (not publishing)"
           fi
 
       - name: Build aarch64
@@ -50,19 +67,38 @@ jobs:
           chmod +x devsignal
           ./devsignal --version
 
-      # Signing and notarization run only when the certificate secret is configured, so forks and
-      # unsigned dry-run tags still produce a usable (quarantined) artifact.
+      # Notarization needs four more secrets than signing does. Gating on the certificate alone
+      # meant a half-configured repo would sign successfully and then fail at notarization, after
+      # the artifact was already built.
       - name: Check for signing credentials
         id: signing
         env:
           CERT_P12: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          NOTARY_KEY: ${{ secrets.APPLE_NOTARY_API_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
         run: |
-          if [[ -n "$CERT_P12" ]]; then
+          missing=()
+          [[ -n "$CERT_P12" ]]         || missing+=(APPLE_CERT_P12_BASE64)
+          [[ -n "$CERT_PASSWORD" ]]    || missing+=(APPLE_CERT_PASSWORD)
+          [[ -n "$NOTARY_KEY" ]]       || missing+=(APPLE_NOTARY_API_KEY)
+          [[ -n "$NOTARY_KEY_ID" ]]    || missing+=(APPLE_NOTARY_KEY_ID)
+          [[ -n "$NOTARY_ISSUER_ID" ]] || missing+=(APPLE_NOTARY_ISSUER_ID)
+
+          if [[ ${#missing[@]} -eq 0 ]]; then
             echo "available=true" >> "$GITHUB_OUTPUT"
-          else
+            echo "All signing credentials present; the binary will be signed and notarized."
+          elif [[ ${#missing[@]} -eq 5 ]]; then
+            # None configured: a deliberate unsigned build (forks, dry runs).
             echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::APPLE_CERT_P12_BASE64 is not set; publishing an unsigned binary. \
-            Users will need to clear the Gatekeeper quarantine attribute."
+            echo "::warning::No Apple credentials configured; publishing an unsigned binary. \
+            Users will need to clear the Gatekeeper quarantine attribute (install.sh does this)."
+          else
+            # Partial: a misconfiguration, not a reason to quietly ship unsigned.
+            echo "::error::Signing is partially configured. Missing: ${missing[*]}. \
+            Set all five secrets, or none of them."
+            exit 1
           fi
 
       - name: Import certificate and codesign
@@ -96,9 +132,9 @@ jobs:
           codesign --verify --strict --verbose=2 devsignal
 
       - name: Package tarball
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          tar czvf "devsignal-${VERSION}-macos-universal.tar.gz" devsignal
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: tar czvf "devsignal-${VERSION}-macos-universal.tar.gz" devsignal
 
       # Runs after packaging only because the tarball already contains the signed binary; the
       # submission itself is a separate zip (see below).
@@ -126,7 +162,17 @@ jobs:
       - name: Generate checksums
         run: shasum -a 256 devsignal-*-macos-universal.tar.gz > SHA256SUMS
 
+      - name: Summarise dry run
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "### Dry run complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "Built, checked, and packaged without publishing." >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload GitHub Release
+        if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true

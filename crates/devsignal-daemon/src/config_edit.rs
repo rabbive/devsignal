@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
-use devsignal_core::{Config, PresenceRule, RuleThen, RuleWhen, TimeWindow, HOST_BUNDLE_LABELS};
+use devsignal_core::{
+    AgentRule, ButtonConfig, Config, PresenceRule, RuleThen, RuleWhen, TimeWindow,
+    HOST_BUNDLE_LABELS,
+};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
@@ -18,9 +21,25 @@ pub enum HostsCommand {
 
 #[derive(Debug)]
 pub enum AgentsCommand {
-    List { config: PathBuf },
-    Enable { config: PathBuf, id: String },
-    Disable { config: PathBuf, id: String },
+    List {
+        config: PathBuf,
+    },
+    Enable {
+        config: PathBuf,
+        id: String,
+    },
+    Disable {
+        config: PathBuf,
+        id: String,
+    },
+    Add {
+        config: PathBuf,
+        rule: Box<AgentRule>,
+    },
+    Remove {
+        config: PathBuf,
+        id: String,
+    },
 }
 
 #[derive(Debug)]
@@ -68,20 +87,128 @@ pub fn parse_hosts_command(args: &[String]) -> Result<ConfigEditCommand> {
 pub fn parse_agents_command(args: &[String]) -> Result<ConfigEditCommand> {
     let mut args = args.to_vec();
     let config = take_config(&mut args)?;
-    match args.as_slice() {
-        [cmd] if cmd == "list" => Ok(ConfigEditCommand::Agents(AgentsCommand::List { config })),
-        [cmd, id] if cmd == "enable" => Ok(ConfigEditCommand::Agents(AgentsCommand::Enable {
+    match args.first().map(String::as_str) {
+        Some("list") if args.len() == 1 => {
+            Ok(ConfigEditCommand::Agents(AgentsCommand::List { config }))
+        }
+        Some("enable") if args.len() == 2 => Ok(ConfigEditCommand::Agents(AgentsCommand::Enable {
             config,
-            id: id.clone(),
+            id: args[1].clone(),
         })),
-        [cmd, id] if cmd == "disable" => Ok(ConfigEditCommand::Agents(AgentsCommand::Disable {
+        Some("disable") if args.len() == 2 => {
+            Ok(ConfigEditCommand::Agents(AgentsCommand::Disable {
+                config,
+                id: args[1].clone(),
+            }))
+        }
+        Some("remove") if args.len() == 2 => Ok(ConfigEditCommand::Agents(AgentsCommand::Remove {
             config,
-            id: id.clone(),
+            id: args[1].clone(),
+        })),
+        Some("add") => Ok(ConfigEditCommand::Agents(AgentsCommand::Add {
+            config,
+            rule: Box::new(parse_agent_add(&args[1..])?),
         })),
         _ => anyhow::bail!(
-            "usage: devsignal agents list|enable <agent_id>|disable <agent_id> [--config path]"
+            "usage: devsignal agents list | enable <id> | disable <id> | remove <id> |\n\
+             \x20      add --id <id> --process-name <name> [--label <text>] [--priority <n>]\n\
+             \x20          [--large-image <key>] [--small-image <key>] [--small-text <text>]\n\
+             \x20          [--button \"<label>=<url>\"]"
         ),
     }
+}
+
+/// Parse `agents add`. Field validation (duplicate ids, button limits, empty process names) is left
+/// to `Config::validate`, so the CLI and a hand-edited file are held to exactly the same rules.
+fn parse_agent_add(args: &[String]) -> Result<AgentRule> {
+    let mut id = None;
+    let mut label = None;
+    let mut process_names = Vec::new();
+    let mut argv_substrings = Vec::new();
+    let mut priority = None;
+    let mut large_image = None;
+    let mut small_image = None;
+    let mut small_text = None;
+    let mut buttons = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        let need_value = |flag: &str| -> Result<String> {
+            args.get(i + 1)
+                .cloned()
+                .with_context(|| format!("{flag} requires a value"))
+        };
+        match args[i].as_str() {
+            "--id" => {
+                id = Some(need_value("--id")?);
+                i += 2;
+            }
+            "--label" => {
+                label = Some(need_value("--label")?);
+                i += 2;
+            }
+            "--process-name" => {
+                process_names.push(need_value("--process-name")?);
+                i += 2;
+            }
+            "--argv-substring" => {
+                argv_substrings.push(need_value("--argv-substring")?);
+                i += 2;
+            }
+            "--priority" => {
+                let raw = need_value("--priority")?;
+                priority = Some(
+                    raw.parse::<i32>()
+                        .with_context(|| format!("--priority must be a number (got {raw:?})"))?,
+                );
+                i += 2;
+            }
+            "--large-image" => {
+                large_image = Some(need_value("--large-image")?);
+                i += 2;
+            }
+            "--small-image" => {
+                small_image = Some(need_value("--small-image")?);
+                i += 2;
+            }
+            "--small-text" => {
+                small_text = Some(need_value("--small-text")?);
+                i += 2;
+            }
+            "--button" => {
+                let raw = need_value("--button")?;
+                let (label, url) = raw
+                    .split_once('=')
+                    .context("--button must be formatted as \"<label>=<url>\"")?;
+                buttons.push(ButtonConfig {
+                    label: label.to_string(),
+                    url: url.to_string(),
+                });
+                i += 2;
+            }
+            other => anyhow::bail!("unknown agents add flag: {other}"),
+        }
+    }
+
+    let id = id.context("agents add requires --id <id>")?;
+    anyhow::ensure!(
+        !process_names.is_empty(),
+        "agents add requires at least one --process-name <name>. \n\
+         Run `devsignal detect --unmatched` while the CLI is running to find the right name."
+    );
+
+    Ok(AgentRule {
+        id,
+        label,
+        process_names,
+        argv_substrings,
+        large_image,
+        // Community presets start at 100 so they do not collide with the shipped band (10/20/30).
+        priority: priority.unwrap_or(100),
+        small_image,
+        small_text,
+        buttons,
+    })
 }
 
 pub fn parse_rules_command(args: &[String]) -> Result<ConfigEditCommand> {
@@ -178,9 +305,8 @@ fn write_config(path: &Path, cfg: &Config) -> Result<()> {
     crate::config_io::write_config_atomic(path, cfg)
 }
 
-/// Persist the change, then report it. Rewriting the config from the parsed struct drops comments,
-/// and a running daemon reads its config only at startup — say both out loud rather than letting the
-/// user wonder why nothing happened.
+/// Persist the change, then report it. Rewriting the config from the parsed struct drops comments, so
+/// say that out loud rather than letting the user discover it.
 fn commit(path: &Path, cfg: &Config, message: &str) -> Result<()> {
     write_config(path, cfg)?;
     println!("{message}");
@@ -188,9 +314,8 @@ fn commit(path: &Path, cfg: &Config, message: &str) -> Result<()> {
         "  wrote {} (comments and key order are not preserved)",
         path.display()
     );
-    println!(
-        "  restart the daemon to apply: launchctl kickstart -k gui/$(id -u)/com.devsignal.daemon"
-    );
+    // A running daemon notices the mtime change on its next poll; no restart needed.
+    println!("  a running daemon picks this up on its next poll");
     Ok(())
 }
 
@@ -272,6 +397,29 @@ fn run_agents(cmd: AgentsCommand) -> Result<()> {
             let mut cfg = load_config(&config)?;
             add_unique_case_insensitive(&mut cfg.platforms.disabled_agents, id.clone());
             commit(&config, &cfg, &format!("disabled agent: {id}"))
+        }
+        AgentsCommand::Add { config, rule } => {
+            let mut cfg = load_config(&config)?;
+            let id = rule.id.clone();
+            let names = rule.process_names.join(", ");
+            cfg.agents.push(*rule);
+            // Config::validate rejects a duplicate id, so no separate check is needed here.
+            commit(
+                &config,
+                &cfg,
+                &format!("added agent: {id} (matching: {names})"),
+            )?;
+            println!("  verify with: devsignal detect");
+            Ok(())
+        }
+        AgentsCommand::Remove { config, id } => {
+            let mut cfg = load_config(&config)?;
+            let before = cfg.agents.len();
+            cfg.agents.retain(|a| !a.id.eq_ignore_ascii_case(&id));
+            anyhow::ensure!(cfg.agents.len() != before, "agent not found: {id}");
+            // Leaving a stale entry in disabled_agents would silently suppress a future re-add.
+            remove_case_insensitive(&mut cfg.platforms.disabled_agents, &id);
+            commit(&config, &cfg, &format!("removed agent: {id}"))
         }
     }
 }
@@ -450,6 +598,128 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
         assert!(parse_rules_command(&argv(&["remove"])).is_err());
+    }
+
+    #[test]
+    fn agent_add_collects_every_field() {
+        let cmd = parse_agents_command(&argv(&[
+            "add",
+            "--id",
+            "gemini_cli",
+            "--label",
+            "Gemini CLI",
+            "--process-name",
+            "gemini",
+            "--process-name",
+            "gemini-cli",
+            "--argv-substring",
+            "gemini",
+            "--priority",
+            "105",
+            "--large-image",
+            "gemini_key",
+            "--small-image",
+            "devsignal",
+            "--small-text",
+            "devsignal",
+            "--button",
+            "Docs=https://example.com/docs",
+        ]))
+        .expect("parse");
+
+        let rule = match cmd {
+            ConfigEditCommand::Agents(AgentsCommand::Add { rule, .. }) => *rule,
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(rule.id, "gemini_cli");
+        assert_eq!(rule.label.as_deref(), Some("Gemini CLI"));
+        assert_eq!(rule.process_names, vec!["gemini", "gemini-cli"]);
+        assert_eq!(rule.argv_substrings, vec!["gemini"]);
+        assert_eq!(rule.priority, 105);
+        assert_eq!(rule.large_image.as_deref(), Some("gemini_key"));
+        assert_eq!(rule.small_text.as_deref(), Some("devsignal"));
+        assert_eq!(rule.buttons.len(), 1);
+        assert_eq!(rule.buttons[0].label, "Docs");
+        assert_eq!(rule.buttons[0].url, "https://example.com/docs");
+    }
+
+    /// A URL containing '=' (query strings do) must not be truncated by the split.
+    #[test]
+    fn agent_add_button_splits_on_the_first_equals_only() {
+        let cmd = parse_agents_command(&argv(&[
+            "add",
+            "--id",
+            "x",
+            "--process-name",
+            "xx",
+            "--button",
+            "Issue=https://example.com/q?a=1&b=2",
+        ]))
+        .expect("parse");
+        let rule = match cmd {
+            ConfigEditCommand::Agents(AgentsCommand::Add { rule, .. }) => *rule,
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(rule.buttons[0].url, "https://example.com/q?a=1&b=2");
+    }
+
+    #[test]
+    fn agent_add_defaults_priority_clear_of_the_shipped_band() {
+        let cmd = parse_agents_command(&argv(&["add", "--id", "x", "--process-name", "xx"]))
+            .expect("parse");
+        let rule = match cmd {
+            ConfigEditCommand::Agents(AgentsCommand::Add { rule, .. }) => *rule,
+            other => panic!("unexpected: {other:?}"),
+        };
+        // Shipped presets occupy 10/20/30; a user-added agent must not silently outrank them.
+        assert!(rule.priority >= 100, "got {}", rule.priority);
+    }
+
+    #[test]
+    fn agent_add_requires_id_and_process_name() {
+        assert!(parse_agents_command(&argv(&["add", "--process-name", "x"])).is_err());
+
+        let err = parse_agents_command(&argv(&["add", "--id", "x"])).expect_err("should fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("--process-name"), "got {msg}");
+        // The error should send the user to the tool that finds the right name.
+        assert!(msg.contains("detect --unmatched"), "got {msg}");
+
+        assert!(parse_agents_command(&argv(&["add", "--id"])).is_err());
+        assert!(parse_agents_command(&argv(&["add", "--id", "x", "--nope"])).is_err());
+    }
+
+    #[test]
+    fn agent_add_rejects_a_non_numeric_priority_and_malformed_button() {
+        assert!(parse_agents_command(&argv(&[
+            "add",
+            "--id",
+            "x",
+            "--process-name",
+            "xx",
+            "--priority",
+            "high"
+        ]))
+        .is_err());
+        assert!(parse_agents_command(&argv(&[
+            "add",
+            "--id",
+            "x",
+            "--process-name",
+            "xx",
+            "--button",
+            "no-equals-sign"
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn agents_remove_parses() {
+        match parse_agents_command(&argv(&["remove", "goose"])).expect("parse") {
+            ConfigEditCommand::Agents(AgentsCommand::Remove { id, .. }) => assert_eq!(id, "goose"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(parse_agents_command(&argv(&["remove"])).is_err());
     }
 
     #[test]
