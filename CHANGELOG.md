@@ -3,7 +3,7 @@
 All notable changes to devsignal. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver.
 
-## [0.3.0] - unreleased
+## [0.3.0] - 2026-07-25
 
 First release since 0.2.0 (2026-04-19). Three features had been sitting on `main` unreleased for
 months — anyone installing the documented way was getting the April build — and the work of shipping
