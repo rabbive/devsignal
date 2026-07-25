@@ -3,7 +3,7 @@
 All notable changes to devsignal. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver.
 
-## [0.3.0] - unreleased
+## [0.3.0] - 2026-07-25
 
 First release since 0.2.0 (2026-04-19). Three features had been sitting on `main` unreleased for
 months — anyone installing the documented way was getting the April build — and the work of shipping
@@ -20,6 +20,11 @@ them turned up a series of silent failures underneath.
 
 ### Fixed
 
+- **`cargo test` failed on Apple Silicon.** The detection integration test built its fake agent by
+  copying `/bin/sleep`, but that binary is `arm64e`, and a copy of an Apple platform binary loses its
+  platform trust outside its SIP-protected location — the kernel SIGKILLs it on exec, so no agent
+  process ever existed and the test timed out after 25s. It now symlinks instead, exercising the
+  argv[0] matching branch. Green on x86_64 CI the whole time, red on every M-series Mac.
 - **Presence got stuck in Discord after a launchd shutdown.** `ctrlc` was declared without the
   `termination` feature, so only SIGINT was trapped. `launchctl bootout` and `kickstart -k` — exactly
   what `devsignal init` installs — send SIGTERM, so the daemon exited without clearing presence. The
@@ -95,6 +100,12 @@ them turned up a series of silent failures underneath.
   in the run log. A `workflow_dispatch` trigger exercises the whole path without cutting a tag.
 - The release workflow fails if the tag disagrees with the `Cargo.toml` version.
 - `devsignal --help` documents all nine `rules add` flags, which previously appeared only in the README.
+- **Cursor Agent ships as a default preset**, confirmed with `devsignal detect --unmatched` on macOS.
+  Its CLI is a bash wrapper ending in `exec -a "$0" node …`, so the process name is `node` and only
+  the argv[0] basename identifies it — the shape a regression test now pins.
+- **Claude Desktop (`com.anthropic.claudefordesktop`) is a known host.** It previously fell through
+  to the raw bundle id, so presence read `In com.anthropic.claudefordesktop` for anyone running
+  Claude Code inside the desktop app.
 
 ### Changed
 

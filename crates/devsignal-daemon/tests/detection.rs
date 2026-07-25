@@ -15,8 +15,16 @@ const SET_MARKER: &str = "presence:set";
 /// Generous: each step needs at least one poll tick, and CI runners are slow.
 const STEP_TIMEOUT: Duration = Duration::from_secs(25);
 
-/// A process whose name devsignal will match. Copying `sleep` under a chosen filename means both the
-/// process name and `argv[0]` basename match, without relying on shell-specific `exec -a`.
+/// A process whose `argv[0]` basename devsignal will match: a **symlink** to `sleep` under a chosen
+/// filename. Exec'ing through it runs the real `/bin/sleep` vnode while `argv[0]` stays the symlink
+/// path, so the matcher's argv[0] branch — the same one that catches wrapped CLIs like
+/// `node .../codex` — is what identifies it.
+///
+/// This used to `fs::copy` the binary so the process *name* matched too. That cannot work on Apple
+/// Silicon: `/bin/sleep` is `arm64e`, and a copy of an Apple platform binary loses its platform trust
+/// outside its SIP-protected location, so the kernel SIGKILLs it on exec (`exit 137`) and no agent
+/// process ever exists to detect. The name is truncated to 16 chars by the kernel anyway, which
+/// `devsignal-test-agent` exceeds.
 fn fake_agent_binary(dir: &std::path::Path) -> std::path::PathBuf {
     let sleep = ["/bin/sleep", "/usr/bin/sleep"]
         .into_iter()
@@ -24,14 +32,8 @@ fn fake_agent_binary(dir: &std::path::Path) -> std::path::PathBuf {
         .find(|p| p.exists())
         .expect("a sleep binary must exist");
     let dst = dir.join("devsignal-test-agent");
-    std::fs::copy(&sleep, &dst).expect("copy sleep");
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&dst).expect("metadata").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&dst, perms).expect("chmod");
-    }
+    std::os::unix::fs::symlink(&sleep, &dst).expect("symlink sleep");
     dst
 }
 

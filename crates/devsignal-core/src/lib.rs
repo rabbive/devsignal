@@ -249,7 +249,7 @@ fn default_priority() -> i32 {
 ///
 /// **Only agents whose process names have been confirmed on a real machine live here.** A default
 /// that silently never matches is worse than no default: the daemon looks broken and the user has no
-/// way to tell a wrong `process_names` from "devsignal is not working". Ten further presets ship as
+/// way to tell a wrong `process_names` from "devsignal is not working". Nine further presets ship as
 /// opt-in snippets in `docs/community-presets.md`, to be confirmed with `devsignal detect` and added
 /// with `devsignal agents add`.
 ///
@@ -309,6 +309,10 @@ pub fn agent_presets() -> Vec<AgentRule> {
             30,
             Some(("OpenCode Docs", "https://opencode.ai")),
         ),
+        // Confirmed on macOS: the CLI is a bash wrapper that ends in
+        // `exec -a "$0" node .../index.js`, so the process *name* is `node` while `argv[0]` keeps
+        // the wrapper path. It matches on the argv[0] basename, not the name.
+        preset("cursor_agent", "Cursor Agent", &["cursor-agent"], 40, None),
     ]
 }
 
@@ -600,6 +604,7 @@ impl Debouncer {
 
 /// Known bundle id → short label for Discord `state` (editors, terminals, JetBrains SKUs).
 pub const HOST_BUNDLE_LABELS: &[(&str, &str)] = &[
+    ("com.anthropic.claudefordesktop", "Claude Desktop"),
     ("com.todesktop.230313mzl4w4u92", "Cursor"),
     ("com.microsoft.VSCode", "VS Code"),
     ("com.vscodium", "VSCodium"),
@@ -1147,7 +1152,10 @@ mod tests {
     #[test]
     fn shipped_presets_are_the_confirmed_set() {
         let ids: Vec<String> = agent_presets().into_iter().map(|a| a.id).collect();
-        assert_eq!(ids, vec!["claude_code", "codex", "opencode"]);
+        assert_eq!(
+            ids,
+            vec!["claude_code", "codex", "opencode", "cursor_agent"]
+        );
     }
 
     #[test]
@@ -1317,7 +1325,6 @@ mod tests {
         for expected in [
             "gemini_cli",
             "amp",
-            "cursor_agent",
             "copilot_cli",
             "aider",
             "crush",
@@ -1724,6 +1731,36 @@ mod tests {
             host_label_for_bundle("com.example.unknown"),
             "com.example.unknown"
         );
+    }
+
+    /// Claude Code's own desktop host used to fall through to the raw bundle id, so presence read
+    /// `In com.anthropic.claudefordesktop` — observed on a real machine before this entry existed.
+    #[test]
+    fn host_label_covers_claude_desktop() {
+        assert_eq!(
+            host_label_for_bundle("com.anthropic.claudefordesktop"),
+            "Claude Desktop"
+        );
+    }
+
+    /// `cursor-agent` is a bash wrapper ending in `exec -a "$0" node .../index.js`, so sysinfo
+    /// reports the name as `node` and only the argv[0] basename identifies it. Confirmed with
+    /// `devsignal detect --unmatched` on macOS; this asserts the shipped preset matches that shape.
+    #[test]
+    fn cursor_agent_preset_matches_node_wrapper() {
+        let rule = agent_presets()
+            .into_iter()
+            .find(|p| p.id == "cursor_agent")
+            .expect("cursor_agent preset must ship");
+        assert!(process_matches_rule(
+            "node",
+            &[
+                OsStr::new("/Users/someone/.local/bin/cursor-agent"),
+                OsStr::new("--use-system-ca"),
+            ],
+            &rule
+        ));
+        assert!(!process_matches_rule("node", &[OsStr::new("node")], &rule));
     }
 
     #[test]

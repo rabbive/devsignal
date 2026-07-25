@@ -32,8 +32,8 @@ large_text  = "devsignal"   # Hover tooltip for the idle large image.
 #                  uploaded renders blank — delete the line to fall back to "devsignal".
 # buttons:         up to 2 clickable buttons. More than 2 is rejected at load.
 #
-# Only agents with confirmed process names ship here. For Gemini CLI, Amp, Cursor Agent,
-# Copilot CLI, Aider, Crush, Qwen Code, Droid, Cline, and Goose, see docs/community-presets.md
+# Only agents with confirmed process names ship here. For Gemini CLI, Amp, Copilot CLI, Aider,
+# Crush, Qwen Code, Droid, Cline, and Goose, see docs/community-presets.md
 # — those names are unconfirmed, so the workflow is:
 #     1. start your agent CLI
 #     2. devsignal detect --unmatched      # find what your machine actually reports
@@ -77,6 +77,17 @@ small_text    = "devsignal"
   [[agents.buttons]]
   label = "OpenCode Docs"
   url   = "https://opencode.ai"
+
+# The cursor-agent CLI is a bash wrapper that ends in `exec -a "$0" node .../index.js`, so the
+# process name is "node" and only the basename of argv[0] identifies it. Matching covers both.
+[[agents]]
+id            = "cursor_agent"
+label         = "Cursor Agent"
+process_names = ["cursor-agent"]
+priority      = 40
+large_image   = "cursor_agent"
+small_image   = "devsignal"
+small_text    = "devsignal"
 
 # ── Presence rules (optional) ──────────────────────────────────────────────────
 # First match wins, evaluated in file order. `when` fields are ANDed; within a

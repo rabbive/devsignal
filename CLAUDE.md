@@ -194,7 +194,9 @@ to stdout. Platform gating is a runtime check in `require_macos`, applied only t
 - Platform gating is a runtime check (`require_macos`), not `cfg`, so CI can lint and test everything
   except `devsignal-macos`. Only `run` and `init` are gated.
 - Presence assets are Discord art-asset **keys**, not URLs — they must be uploaded in the Discord
-  Developer Portal (`devsignal`, `claude`, `codex`, `opencode` by default).
+  Developer Portal. Each preset's key is its id, so the defaults are `devsignal`, `claude_code`,
+  `codex`, `opencode`, `cursor_agent` — `preset_asset_keys()` is the authoritative list and is what
+  `init` prints.
 
 ## Config
 
