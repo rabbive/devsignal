@@ -3,3 +3,5 @@
 .DS_Store
 .cursor/
 .worktrees/
+# Output of scripts/verify-macos-release.sh
+/verify-report.txt

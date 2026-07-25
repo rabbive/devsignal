@@ -281,6 +281,12 @@ host apps there, with a test asserting the entry when it matters. Unknown bundle
      first real tag is not also signing's first execution.
   4. `install.sh` against a real v0.3.0 release, including the Gatekeeper path.
 
+  Items 1 and 2 are what `./scripts/verify-macos-release.sh [--launchd]` automates: it builds,
+  runs the detect sweep, does the LaunchAgent round trip, and writes `verify-report.txt`. Item 3
+  was dry-run on 2026-07-25 (release workflow run `30148303009`) and the build/lipo/package/
+  checksum path is green, but the signing gate took its all-five-secrets-missing branch, so
+  `codesign` and `notarize` were skipped and remain unexecuted.
+
   Then date the `CHANGELOG.md` heading and tag. The release workflow fails if the tag disagrees with
   `Cargo.toml`, so bump both together.
 
