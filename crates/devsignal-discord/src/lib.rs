@@ -42,10 +42,21 @@ impl PresenceSession {
             assets = assets.small_text(st.clone());
         }
 
-        let mut act = activity::Activity::new()
-            .details(view.details.clone())
-            .state(view.state.clone())
-            .assets(assets);
+        let mut act = activity::Activity::new().assets(assets);
+
+        // Discord renders name / details / state as three lines, in that order. `name` overrides
+        // the Discord application's own name, which is what puts the agent on the first line
+        // instead of "devsignal"; leaving any of them unset omits that line rather than showing an
+        // empty one.
+        if let Some(ref name) = view.name {
+            act = act.name(name.clone());
+        }
+        if let Some(ref details) = view.details {
+            act = act.details(details.clone());
+        }
+        if let Some(ref state) = view.state {
+            act = act.state(state.clone());
+        }
 
         if let Some(ts) = view.start_timestamp_unix {
             act = act.timestamps(activity::Timestamps::new().start(ts as i64));

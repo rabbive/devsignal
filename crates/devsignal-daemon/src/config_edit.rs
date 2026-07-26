@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use devsignal_core::{
-    AgentRule, ButtonConfig, Config, PresenceRule, RuleThen, RuleWhen, TimeWindow,
-    HOST_BUNDLE_LABELS,
+    AgentRule, ButtonConfig, Config, PresenceRule, RuleThen, RuleWhen, TimeWindow, HOST_APPS,
 };
 use std::path::{Path, PathBuf};
 
@@ -341,17 +340,18 @@ fn run_hosts(cmd: HostsCommand) -> Result<()> {
     match cmd {
         HostsCommand::List { config } => {
             let cfg = load_config(&config)?;
-            for (bundle, label) in HOST_BUNDLE_LABELS {
+            for app in HOST_APPS {
                 let enabled = !cfg
                     .platforms
                     .disabled_hosts
                     .iter()
-                    .any(|id| id.eq_ignore_ascii_case(bundle));
+                    .any(|id| id.eq_ignore_ascii_case(app.bundle_id));
                 println!(
-                    "{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}",
                     if enabled { "enabled" } else { "disabled" },
-                    bundle,
-                    label
+                    app.bundle_id,
+                    app.label,
+                    app.image
                 );
             }
             Ok(())

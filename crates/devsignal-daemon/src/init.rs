@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use console::style;
 use devsignal_core::{
-    agent_presets, parse_numeric_id, AgentRule, Config, DiscordSection, IdleMode, PlatformsConfig,
-    PresenceRule, RuleThen, RuleWhen, TimeWindow, HOST_BUNDLE_LABELS,
+    agent_presets, host_image_keys, parse_numeric_id, AgentRule, Config, DiscordSection, IdleMode,
+    ImageMode, ImagesConfig, PlatformsConfig, PresenceLine, PresenceRule, PresenceSection,
+    RuleThen, RuleWhen, TimeWindow, HOST_APPS,
 };
 use dialoguer::{Confirm, Input, MultiSelect, Select};
 use std::fs;
@@ -38,6 +39,8 @@ fn default_agents() -> Vec<AgentRule> {
 fn generate_config(
     discord_client_id: String,
     show_cwd_basename: bool,
+    presence: PresenceSection,
+    images: ImagesConfig,
     agents: Vec<AgentRule>,
     disabled_hosts: Vec<String>,
     rules: Vec<PresenceRule>,
@@ -47,6 +50,8 @@ fn generate_config(
         min_push_interval_secs: 20,
         idle_mode: IdleMode::Status,
         show_cwd_basename,
+        presence,
+        images,
         discord: DiscordSection {
             client_id: discord_client_id,
             large_image: "devsignal".to_string(),
@@ -139,10 +144,80 @@ fn choose_agents() -> Result<Vec<AgentRule>> {
     Ok(out)
 }
 
+/// Which of Discord's three lines carries what.
+///
+/// The classic layout is offered first, and is the default, because line 1 is the Discord
+/// *application's* name unless the client honours the activity-name override. Where it does not,
+/// "agent first" costs you the agent label entirely — so this is an opt-in with the trade-off
+/// spelled out, not a silent new default.
+fn choose_presence_layout(show_cwd_basename: bool) -> Result<PresenceSection> {
+    let items = vec![
+        "Classic — devsignal / Claude Code / In Ghostty",
+        "Agent first — Claude Code / In Ghostty / devsignal (overrides the app name on line 1)",
+    ];
+    let idx = Select::new()
+        .with_prompt("Line order in the Discord card")
+        .items(&items)
+        .default(0)
+        .interact()
+        .context("read presence layout selection")?;
+
+    if idx == 0 {
+        return Ok(PresenceSection::default());
+    }
+    Ok(PresenceSection {
+        name: PresenceLine::Agent,
+        details: PresenceLine::Host,
+        // With the project on its own line it stops riding along as "In Ghostty · myrepo".
+        state: if show_cwd_basename {
+            PresenceLine::Project
+        } else {
+            PresenceLine::Brand
+        },
+        brand_text: "devsignal".to_string(),
+    })
+}
+
+/// Hosted PNGs or uploaded art-asset keys.
+///
+/// `host_icon` is only offered in url mode: in key mode it would need every icon in
+/// [`host_image_keys`] uploaded by hand, and a missing key shows as a blank circle.
+fn choose_images() -> Result<ImagesConfig> {
+    let items = vec![
+        "Hosted PNGs — nothing to upload (assets/discord/ on GitHub)",
+        "Art-asset keys — images you upload in the Discord Developer Portal",
+    ];
+    let idx = Select::new()
+        .with_prompt("Where should presence images come from?")
+        .items(&items)
+        .default(0)
+        .interact()
+        .context("read image mode selection")?;
+
+    if idx == 1 {
+        return Ok(ImagesConfig {
+            mode: ImageMode::Key,
+            host_icon: false,
+            ..ImagesConfig::default()
+        });
+    }
+
+    let host_icon = Confirm::new()
+        .with_prompt("Show the frontmost editor/terminal as the small corner icon?")
+        .default(true)
+        .interact()
+        .context("read host_icon")?;
+    Ok(ImagesConfig {
+        mode: ImageMode::Url,
+        host_icon,
+        ..ImagesConfig::default()
+    })
+}
+
 fn choose_disabled_hosts() -> Result<Vec<String>> {
-    let labels = HOST_BUNDLE_LABELS
+    let labels = HOST_APPS
         .iter()
-        .map(|(bundle, label)| format!("{label} ({bundle})"))
+        .map(|app| format!("{} ({})", app.label, app.bundle_id))
         .collect::<Vec<_>>();
     let defaults = vec![true; labels.len()];
     let selections = MultiSelect::new()
@@ -154,11 +229,11 @@ fn choose_disabled_hosts() -> Result<Vec<String>> {
     let enabled = selections
         .into_iter()
         .collect::<std::collections::HashSet<_>>();
-    Ok(HOST_BUNDLE_LABELS
+    Ok(HOST_APPS
         .iter()
         .enumerate()
         .filter(|(idx, _)| !enabled.contains(idx))
-        .map(|(_, (bundle, _))| (*bundle).to_string())
+        .map(|(_, app)| app.bundle_id.to_string())
         .collect())
 }
 
@@ -459,6 +534,9 @@ pub fn cmd_init(config_path: &Path) -> Result<()> {
             .context("read show_cwd_basename")?,
     };
 
+    let presence = choose_presence_layout(show_cwd_basename)?;
+    let images = choose_images()?;
+
     let agents = choose_agents()?;
     anyhow::ensure!(
         !agents.is_empty(),
@@ -472,12 +550,6 @@ pub fn cmd_init(config_path: &Path) -> Result<()> {
 
     println!();
     println!("{}", style("Art assets").bold());
-    println!(
-        "Presence images are Discord asset KEYS, uploaded under\n\
-         Developer Portal → Rich Presence → Art Assets. A key you have not uploaded renders blank —\n\
-         remove the large_image line for that agent to fall back to \"devsignal\"."
-    );
-    println!("Keys referenced by your selection:");
     let mut keys = vec!["devsignal".to_string()];
     for agent in &agents {
         if let Some(key) = &agent.large_image {
@@ -486,8 +558,36 @@ pub fn cmd_init(config_path: &Path) -> Result<()> {
             }
         }
     }
-    for key in &keys {
-        println!("  - {key}");
+    match images.mode {
+        ImageMode::Url => {
+            println!(
+                "Nothing to upload: images resolve to PNGs under\n  {}\n\
+                 Discord accepts a plain https image URL wherever it accepts an asset key.",
+                images.base_url
+            );
+            println!("Agent images your selection uses:");
+            for key in &keys {
+                println!("  - {}/agents/{key}.png", images.base_url);
+            }
+        }
+        ImageMode::Key => {
+            println!(
+                "Presence images are Discord asset KEYS, uploaded under\n\
+                 Developer Portal → Rich Presence → Art Assets. A key you have not uploaded renders \
+                 blank —\nremove the large_image line for that agent to fall back to \"devsignal\". \
+                 The PNGs to\nupload are in assets/discord/ in the devsignal repo."
+            );
+            println!("Keys referenced by your selection:");
+            for key in &keys {
+                println!("  - {key}");
+            }
+            println!(
+                "Host icons are off in key mode; turning on images.host_icon means uploading\n\
+                 these {} host keys too: {}",
+                host_image_keys().len(),
+                host_image_keys().join(", ")
+            );
+        }
     }
     println!();
 
@@ -507,6 +607,8 @@ pub fn cmd_init(config_path: &Path) -> Result<()> {
     let cfg = generate_config(
         discord_client_id,
         show_cwd_basename,
+        presence,
+        images,
         agents,
         disabled_hosts,
         rules,
@@ -530,7 +632,15 @@ mod tests {
 
     #[test]
     fn generate_config_sets_cwd_flag() {
-        let cfg = generate_config("1".into(), true, default_agents(), vec![], vec![]);
+        let cfg = generate_config(
+            "1".into(),
+            true,
+            PresenceSection::default(),
+            ImagesConfig::default(),
+            default_agents(),
+            vec![],
+            vec![],
+        );
         assert!(cfg.show_cwd_basename);
         assert_eq!(cfg.discord.client_id, "1");
         assert!(!cfg.agents.is_empty());
@@ -545,7 +655,15 @@ mod tests {
 
     #[test]
     fn generated_config_from_presets_is_valid() {
-        let cfg = generate_config("123456789".into(), false, default_agents(), vec![], vec![]);
+        let cfg = generate_config(
+            "123456789".into(),
+            false,
+            PresenceSection::default(),
+            ImagesConfig::default(),
+            default_agents(),
+            vec![],
+            vec![],
+        );
         cfg.validate().expect("wizard output must load");
     }
 
@@ -556,6 +674,8 @@ mod tests {
             let cfg = generate_config(
                 "123456789".into(),
                 show_cwd,
+                PresenceSection::default(),
+                ImagesConfig::default(),
                 default_agents(),
                 vec![],
                 privacy_preset_rules(preset),
