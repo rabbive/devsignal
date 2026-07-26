@@ -15,11 +15,13 @@ no preset. `devsignal detect --unmatched` tells you what your machine actually r
 1. Open the [Discord Developer Portal](https://discord.com/developers/applications) and **New Application**.
 2. In **OAuth2** (optional for local IPC): not required for Rich Presence; you only need the app record.
 3. Copy **Application ID** (this is the Rich Presence `client_id`).
-4. Under **Rich Presence → Art Assets**, upload PNGs. Each **image key** must match what you put in
-   `config.toml` (`large_image` per agent, plus the global `devsignal` default). A key you have not
-   uploaded renders **blank**, so upload only the agents you use and delete the `large_image` line
-   for the rest — they then fall back to the `devsignal` image. `devsignal init` prints the exact
-   list of keys for your selection.
+4. **Images: nothing to upload** if you use `[images] mode = "url"` — presence images then resolve to
+   the PNGs in [`assets/discord/`](assets/discord/), since Discord accepts an image URL wherever it
+   accepts an art-asset key. To upload them instead, use **Rich Presence → Art Assets** with
+   `mode = "key"`: each **image key** must match what you put in `config.toml` (`large_image` per
+   agent, plus the global `devsignal` default), and a key you have not uploaded renders **blank**, so
+   upload only the agents you use and delete the `large_image` line for the rest. `devsignal init`
+   prints the exact list either way.
 5. Install and run the **Discord desktop** client (not only the web app). The daemon connects over local IPC.
 
 ## Quick start
@@ -134,6 +136,54 @@ xattr -d com.apple.quarantine ~/bin/devsignal
 
 Host detection prefers **AppKit** (`NSWorkspace` / `NSRunningApplication`). If that path returns nothing **twice in a row**, the daemon falls back to AppleScript (`osascript`) against **System Events**, which may prompt for **Automation** access for the app that launches `devsignal` (for example Terminal, iTerm2, or Cursor).
 
+## What the card shows
+
+Discord draws three lines, and the first one is the **application's** name unless you override it:
+
+| Line | Config | Default |
+| --- | --- | --- |
+| 1 | `presence.name` | `off` → the Discord application name (`devsignal`) |
+| 2 | `presence.details` | `agent` → `Claude Code` |
+| 3 | `presence.state` | `host` → `In Ghostty` |
+
+Each slot takes `agent`, `host`, `project`, `brand` (`presence.brand_text`), or `off`. Two slots may
+not carry the same value, and `project` requires `show_cwd_basename = true` — both are load-time
+errors rather than a blank line at runtime.
+
+To lead with the agent instead of the app name:
+
+```toml
+[presence]
+name    = "agent"    # Claude Code
+details = "host"     # In Ghostty
+state   = "brand"    # devsignal   (or "project" with show_cwd_basename = true)
+```
+
+`name` overrides the activity name Discord would otherwise take from your application. Check it in
+your own client the first time: if line 1 still reads `devsignal`, your client is ignoring the
+override — rename the application in the Developer Portal, or keep the default order.
+
+### Images
+
+Every agent and host app ships a 512×512 PNG in [`assets/discord/`](assets/discord/). Discord accepts
+a plain `https://` image URL wherever it accepts an uploaded art-asset key, so nothing has to be
+uploaded:
+
+```toml
+[images]
+mode      = "url"
+base_url  = "https://raw.githubusercontent.com/rabbive/devsignal/main/assets/discord"
+host_icon = true     # frontmost editor/terminal as the small corner icon
+```
+
+`mode = "key"` (the default) keeps the original behaviour: image values are art-asset keys you upload
+yourself — the same PNGs, filename minus `.png` as the key. `host_icon` is best left off in key mode
+unless you upload one per host (`devsignal hosts list` prints them). An image value that is already an
+absolute `http(s)` URL is passed through in either mode, so one agent can point at its own art.
+
+`host_icon` follows the host *label*: anything that hides the label — `platforms.disabled_hosts`, a
+rule's `hide_host` — hides the icon too, so the app cannot leak through its image.
+
 ## Configuration
 
 - `poll_interval_secs`: how often processes and the frontmost app are sampled.
@@ -142,6 +192,8 @@ Host detection prefers **AppKit** (`NSWorkspace` / `NSRunningApplication`). If t
 - `show_cwd_basename`: when `true`, appends the **basename only** of the winning agent process working directory (never full paths). Off by default for privacy.
 - `[[agents]]`: `process_names` match **case-insensitively** against the `sysinfo` process name **or** the **basename of argv0** (so wrapped CLIs like `node …/codex` can match `codex`). Optional `argv_substrings` narrow matches when non-empty — **at least one** must appear in the command line (case-insensitive).
 - `priority`: **lower number wins** when multiple agents match.
+- `[presence]`: which of Discord's three lines carries the agent, host, project, or brand text — see [What the card shows](#what-the-card-shows).
+- `[images]`: `mode = "url"` resolves image names to hosted PNGs under `base_url`; `mode = "key"` treats them as uploaded art-asset keys. `host_icon` puts the frontmost editor/terminal in the small corner slot.
 - `[platforms]`: `disabled_hosts` hides selected host app bundle ids; `disabled_agents` ignores selected agent ids. All known hosts/agents are enabled by default.
 - `[[rules]]`: first-match presence rules. Conditions can match host bundle ids, agent ids, active/idle state, project basename, and local time windows. Actions can hide the host and/or override the state line.
 
@@ -212,7 +264,7 @@ sequenceDiagram
       Sys->>Core: cwd redact basename
     end
     Mac->>Core: frontmost_bundle_id
-    Core->>Core: build_presence_view
+    Core->>Core: build_presence_view (lines + image resolution)
     Core->>Deb: should_push
     Deb->>DRP: set_presence or clear
     DRP->>DC: Unix socket IPC
@@ -229,8 +281,12 @@ flowchart LR
   load --> agents[[agents rules]]
   load --> discordSec[discord section]
   load --> policy[poll min_push idle_mode cwd]
+  load --> lines[presence line slots]
+  load --> imgs[images mode and base_url]
   agents --> match[Process argv matcher]
   policy --> loop[Daemon loop]
+  lines --> loop
+  imgs --> loop
   discordSec --> ipc[Rich Presence client_id]
 ```
 

@@ -65,8 +65,9 @@ mod tests {
 
     fn sample_view() -> PresenceView {
         PresenceView {
-            details: "Claude Code".into(),
-            state: "In VS Code".into(),
+            name: Some("Claude Code".into()),
+            details: Some("In VS Code".into()),
+            state: Some("devsignal".into()),
             large_image: "devsignal".into(),
             large_text: String::new(),
             small_image: None,

@@ -7,6 +7,47 @@ min_push_interval_secs = 20   # Minimum time between Discord IPC pushes (reduces
 idle_mode              = "status"  # "status" = show Idle line; "clear" = hide presence entirely.
 show_cwd_basename      = false     # Show the basename of the agent's working directory. Off by default for privacy.
 
+# ── Line order ─────────────────────────────────────────────────────────────────
+# Discord draws three lines, in this order:
+#
+#   line 1   presence.name     — defaults to the Discord APPLICATION's name ("devsignal")
+#   line 2   presence.details
+#   line 3   presence.state
+#
+# Each slot takes: "agent" (Claude Code) | "host" (In Ghostty) | "project" (repo basename)
+#                | "brand" (presence.brand_text) | "off" (omit the line).
+# Two slots may not carry the same thing, and "project" requires show_cwd_basename = true.
+[presence]
+details    = "agent"      # devsignal / Claude Code / In Ghostty
+state      = "host"
+brand_text = "devsignal"
+
+# To put the agent on the first line instead — Claude Code / In Ghostty / devsignal —
+# set name = "agent". That overrides the application name Discord would otherwise show,
+# so check it in your own client: if line 1 still reads "devsignal", either rename the
+# application in the Developer Portal or keep the classic order above.
+#
+# [presence]
+# name    = "agent"
+# details = "host"
+# state   = "brand"        # or "project" with show_cwd_basename = true
+
+# ── Images ─────────────────────────────────────────────────────────────────────
+# mode = "url": every image name resolves to {base_url}/{agents|hosts}/{name}.png, so
+#               nothing has to be uploaded — Discord accepts a plain https image URL
+#               wherever it accepts an art-asset key.
+# mode = "key": names are art-asset keys you upload under
+#               Developer Portal → Rich Presence → Art Assets. The PNGs to upload are the
+#               same files, in assets/discord/ in the devsignal repo.
+# An image value that is already an absolute http(s) URL is passed through in either mode.
+[images]
+mode      = "url"
+base_url  = "https://raw.githubusercontent.com/rabbive/devsignal/main/assets/discord"
+host_icon = true   # Show the frontmost editor/terminal as the small corner icon.
+                   # Suppressed whenever the host label itself is hidden, so hide_host
+                   # does not leak the app through its icon. Leave this off in key mode
+                   # unless you have uploaded a key per host (`devsignal hosts list`).
+
 [platforms]
 # All known host apps and agents are enabled by default. Add ids here to hide/ignore them.
 disabled_hosts  = [] # e.g. ["com.todesktop.230313mzl4w4u92"] to hide Cursor as a host label.
@@ -15,7 +56,7 @@ disabled_agents = [] # e.g. ["opencode"] to ignore that agent rule.
 [discord]
 # Your Discord Application ID from https://discord.com/developers/applications
 client_id   = "YOUR_DISCORD_APPLICATION_ID"
-large_image = "devsignal"   # Art asset key shown when no agent is detected (idle).
+large_image = "devsignal"   # Image shown when no agent is detected (idle).
 large_text  = "devsignal"   # Hover tooltip for the idle large image.
 # small_image = "devsignal" # Optional: small corner icon shown during idle.
 # small_text  = "Idle"      # Optional: tooltip for the idle small icon.
@@ -27,9 +68,11 @@ large_text  = "devsignal"   # Hover tooltip for the idle large image.
 # priority:        lower number wins when multiple agents match; ties break on lower PID.
 #                  Presets are spaced by 10 so you can slot your own rules between them.
 # large_image /
-# small_image:     Discord art-asset KEYS, not URLs. Upload them under
-#                  Developer Portal → Rich Presence → Art Assets. A key you have not
-#                  uploaded renders blank — delete the line to fall back to "devsignal".
+# small_image:     image names resolved through [images] above — a PNG stem under
+#                  assets/discord/agents/ in url mode, an art-asset key in key mode.
+#                  A name with nothing behind it renders blank; delete the line to fall
+#                  back to "devsignal". small_image is only used when host_icon is off or
+#                  the host is hidden, since the host icon owns the small slot.
 # buttons:         up to 2 clickable buttons. More than 2 is rejected at load.
 #
 # Only agents with confirmed process names ship here. For Gemini CLI, Amp, Copilot CLI, Aider,

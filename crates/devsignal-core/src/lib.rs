@@ -20,6 +20,12 @@ pub struct Config {
     /// Append the working-directory **basename** for the winning agent process (never full paths).
     #[serde(default)]
     pub show_cwd_basename: bool,
+    /// Which of Discord's three text lines carries what.
+    #[serde(default)]
+    pub presence: PresenceSection,
+    /// How image values resolve: uploaded art-asset keys, or hosted PNG URLs.
+    #[serde(default)]
+    pub images: ImagesConfig,
     pub discord: DiscordSection,
     #[serde(default)]
     pub agents: Vec<AgentRule>,
@@ -69,6 +75,249 @@ fn default_large_image() -> String {
     "devsignal".to_string()
 }
 
+/// Which piece of information a visible presence line carries.
+///
+/// Discord's card is three lines: the **activity name**, then `details`, then `state`. The name
+/// line defaults to the Discord *application's* name (`devsignal`), which is why the agent used to
+/// land on line 2 — see [`PresenceSection`].
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PresenceLine {
+    /// The agent label, e.g. `Claude Code`; `Idle` when no agent is detected.
+    Agent,
+    /// The frontmost editor or terminal, e.g. `In Ghostty`.
+    Host,
+    /// The project basename. Requires `show_cwd_basename = true`.
+    Project,
+    /// [`PresenceSection::brand_text`], e.g. `devsignal`.
+    Brand,
+    /// Omit this line. For `name`, that means Discord falls back to the application name.
+    #[default]
+    Off,
+}
+
+impl PresenceLine {
+    fn as_str(self) -> &'static str {
+        match self {
+            PresenceLine::Agent => "agent",
+            PresenceLine::Host => "host",
+            PresenceLine::Project => "project",
+            PresenceLine::Brand => "brand",
+            PresenceLine::Off => "off",
+        }
+    }
+}
+
+/// Line assignment for the presence card.
+///
+/// The defaults reproduce devsignal's original layout — `name` off (so Discord shows the
+/// application name), agent in `details`, host in `state`:
+///
+/// ```text
+/// devsignal            <- application name
+/// Claude Code          <- details
+/// In Ghostty           <- state
+/// ```
+///
+/// Setting `name = "agent"`, `details = "host"`, `state = "brand"` puts the agent on top:
+///
+/// ```text
+/// Claude Code
+/// In Ghostty
+/// devsignal
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PresenceSection {
+    /// Line 1. `off` leaves Discord's default: the application's own name.
+    #[serde(default)]
+    pub name: PresenceLine,
+    /// Line 2.
+    #[serde(default = "default_details_line")]
+    pub details: PresenceLine,
+    /// Line 3.
+    #[serde(default = "default_state_line")]
+    pub state: PresenceLine,
+    /// Text rendered by [`PresenceLine::Brand`].
+    #[serde(default = "default_brand_text")]
+    pub brand_text: String,
+}
+
+fn default_details_line() -> PresenceLine {
+    PresenceLine::Agent
+}
+
+fn default_state_line() -> PresenceLine {
+    PresenceLine::Host
+}
+
+fn default_brand_text() -> String {
+    "devsignal".to_string()
+}
+
+impl Default for PresenceSection {
+    fn default() -> Self {
+        Self {
+            name: PresenceLine::Off,
+            details: default_details_line(),
+            state: default_state_line(),
+            brand_text: default_brand_text(),
+        }
+    }
+}
+
+impl PresenceSection {
+    fn lines(&self) -> [PresenceLine; 3] {
+        [self.name, self.details, self.state]
+    }
+
+    fn uses(&self, line: PresenceLine) -> bool {
+        self.lines().contains(&line)
+    }
+
+    pub fn validate(&self, show_cwd_basename: bool) -> Result<()> {
+        if self.uses(PresenceLine::Project) {
+            anyhow::ensure!(
+                show_cwd_basename,
+                "a presence line is set to \"project\", but show_cwd_basename = false, so the \
+                 project name is never resolved and the line would always be blank"
+            );
+        }
+        if self.uses(PresenceLine::Brand) {
+            anyhow::ensure!(
+                !self.brand_text.trim().is_empty(),
+                "a presence line is set to \"brand\", but presence.brand_text is empty"
+            );
+        }
+        // Two slots showing the same thing is the exact complaint this section exists to fix, so
+        // it is a config error rather than a cosmetic surprise at runtime.
+        let slots = [
+            ("name", self.name),
+            ("details", self.details),
+            ("state", self.state),
+        ];
+        for (i, (slot, line)) in slots.iter().enumerate() {
+            if *line == PresenceLine::Off {
+                continue;
+            }
+            for (other_slot, other) in slots.iter().skip(i + 1) {
+                anyhow::ensure!(
+                    line != other,
+                    "presence.{slot} and presence.{other_slot} are both \"{}\"; \
+                     the same text would appear on two lines",
+                    line.as_str()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether image values name an uploaded Discord art asset or a hosted PNG.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageMode {
+    /// Art-asset keys uploaded under Developer Portal → Rich Presence → Art Assets.
+    #[default]
+    Key,
+    /// `{base_url}/{agents|hosts}/{value}.png`, so nothing has to be uploaded. Discord accepts a
+    /// plain `https://` image URL wherever it accepts an asset key.
+    Url,
+}
+
+/// Where presence images come from.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ImagesConfig {
+    #[serde(default)]
+    pub mode: ImageMode,
+    /// Folder that holds `agents/<id>.png` and `hosts/<slug>.png`. Only used by `mode = "url"`.
+    #[serde(default = "default_image_base_url")]
+    pub base_url: String,
+    /// Show the frontmost editor or terminal as the small (corner) icon. Suppressed whenever the
+    /// host label itself is hidden, so `hide_host` does not leak the app through its icon.
+    #[serde(default)]
+    pub host_icon: bool,
+}
+
+/// Discord's asset field is generous but not unbounded; keep resolved URLs comfortably inside it.
+pub const IMAGE_BASE_URL_MAX_CHARS: usize = 400;
+
+fn default_image_base_url() -> String {
+    "https://raw.githubusercontent.com/rabbive/devsignal/main/assets/discord".to_string()
+}
+
+impl Default for ImagesConfig {
+    fn default() -> Self {
+        Self {
+            mode: ImageMode::default(),
+            base_url: default_image_base_url(),
+            host_icon: false,
+        }
+    }
+}
+
+impl ImagesConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.mode == ImageMode::Url {
+            let url = self.base_url.trim();
+            anyhow::ensure!(
+                !url.is_empty(),
+                "images.mode = \"url\" needs images.base_url"
+            );
+            anyhow::ensure!(
+                url.starts_with("http://") || url.starts_with("https://"),
+                "images.base_url {:?} must start with http:// or https://",
+                self.base_url
+            );
+            let len = url.chars().count();
+            anyhow::ensure!(
+                len <= IMAGE_BASE_URL_MAX_CHARS,
+                "images.base_url is {} characters; keep it under {}",
+                len,
+                IMAGE_BASE_URL_MAX_CHARS
+            );
+        }
+        Ok(())
+    }
+
+    /// Turn a configured image value into what Discord should receive.
+    ///
+    /// An absolute URL is passed through untouched, so a single agent can point at its own art
+    /// without switching the whole config to `mode = "url"`.
+    pub fn resolve(&self, folder: ImageFolder, value: &str) -> String {
+        let value = value.trim();
+        if value.starts_with("http://") || value.starts_with("https://") {
+            return value.to_string();
+        }
+        match self.mode {
+            ImageMode::Key => value.to_string(),
+            ImageMode::Url => format!(
+                "{}/{}/{}.png",
+                self.base_url.trim().trim_end_matches('/'),
+                folder.as_str(),
+                value
+            ),
+        }
+    }
+}
+
+/// Which subfolder of `assets/discord/` an image lives in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageFolder {
+    Agents,
+    Hosts,
+}
+
+impl ImageFolder {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ImageFolder::Agents => "agents",
+            ImageFolder::Hosts => "hosts",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentRule {
@@ -83,13 +332,14 @@ pub struct AgentRule {
     /// If non-empty, require at least one of these substrings in the command line (case-insensitive).
     #[serde(default)]
     pub argv_substrings: Vec<String>,
-    /// Discord `large_image` key for this agent (falls back to global).
+    /// Large image for this agent, resolved through [`ImagesConfig`] (falls back to global).
     #[serde(default)]
     pub large_image: Option<String>,
     /// Lower number = higher priority when multiple agents match.
     #[serde(default = "default_priority")]
     pub priority: i32,
-    /// Discord asset key for the small (corner) image for this agent.
+    /// Small (corner) image for this agent, resolved through [`ImagesConfig`]. Only used when
+    /// `images.host_icon` is off or the host is hidden — otherwise the host icon owns that slot.
     #[serde(default)]
     pub small_image: Option<String>,
     /// Tooltip shown on hover over the small image.
@@ -256,8 +506,9 @@ fn default_priority() -> i32 {
 /// `process_names` matches the process name **or** the basename of `argv[0]`, case-insensitively, so
 /// Node- and Python-wrapped CLIs are covered without extra entries.
 ///
-/// `large_image` is a Discord art-asset **key**, not a URL — a key you have not uploaded in the
-/// Developer Portal renders blank. `devsignal init` prints the full list of keys to upload.
+/// `large_image` is an image **name**, resolved through [`ImagesConfig`]: a PNG stem under
+/// `assets/discord/agents/` in url mode, an art-asset key you uploaded in key mode. Either way a name
+/// with nothing behind it renders blank; `devsignal init` prints the list for the mode you chose.
 /// Priorities are spaced by 10 so you can slot custom rules between presets.
 pub fn agent_presets() -> Vec<AgentRule> {
     fn preset(
@@ -316,7 +567,8 @@ pub fn agent_presets() -> Vec<AgentRule> {
     ]
 }
 
-/// Every distinct Discord art-asset key the presets reference, for the `init` wizard's upload list.
+/// Every distinct agent image name the presets reference — the `init` wizard's upload list in key
+/// mode, and the file stems under `assets/discord/agents/` in url mode.
 pub fn preset_asset_keys() -> Vec<String> {
     let mut keys = vec!["devsignal".to_string()];
     for agent in agent_presets() {
@@ -354,6 +606,10 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         parse_numeric_id(&self.discord.client_id).context("discord.client_id")?;
+        self.presence
+            .validate(self.show_cwd_basename)
+            .context("[presence]")?;
+        self.images.validate().context("[images]")?;
         anyhow::ensure!(
             !self.agents.is_empty(),
             "at least one [[agents]] entry is required"
@@ -472,8 +728,12 @@ pub struct ActiveAgent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PresenceView {
-    pub details: String,
-    pub state: String,
+    /// Overrides the Discord application's name on line 1. `None` leaves Discord's default.
+    pub name: Option<String>,
+    /// Line 2. `None` omits it.
+    pub details: Option<String>,
+    /// Line 3. `None` omits it.
+    pub state: Option<String>,
     pub large_image: String,
     pub large_text: String,
     pub small_image: Option<String>,
@@ -495,9 +755,12 @@ pub enum PresenceAction<'a> {
 }
 
 /// What the debouncer last told Discord, for equality-based deduplication.
+///
+/// The payload is boxed so the enum is not sized by its larger variant — it is stored once per send,
+/// so one allocation per accepted push is cheaper than carrying a `PresenceView` in every `Clear`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LastSent {
-    Set(PresenceView),
+    Set(Box<PresenceView>),
     Clear,
 }
 
@@ -576,7 +839,7 @@ impl Debouncer {
         }
 
         let next = match action {
-            PresenceAction::Set(view) => LastSent::Set(view.clone()),
+            PresenceAction::Set(view) => LastSent::Set(Box::new(view.clone())),
             PresenceAction::Clear => LastSent::Clear,
         };
 
@@ -602,46 +865,93 @@ impl Debouncer {
     }
 }
 
-/// Known bundle id → short label for Discord `state` (editors, terminals, JetBrains SKUs).
-pub const HOST_BUNDLE_LABELS: &[(&str, &str)] = &[
-    ("com.anthropic.claudefordesktop", "Claude Desktop"),
-    ("com.todesktop.230313mzl4w4u92", "Cursor"),
-    ("com.microsoft.VSCode", "VS Code"),
-    ("com.vscodium", "VSCodium"),
-    ("dev.zed.Zed", "Zed"),
-    ("com.apple.dt.Xcode", "Xcode"),
-    ("com.sublimetext.4", "Sublime Text"),
-    ("com.sublimetext.3", "Sublime Text"),
-    ("com.panic.Nova", "Nova"),
-    ("com.jetbrains.fleet", "Fleet"),
-    ("com.jetbrains.intellij", "IntelliJ IDEA"),
-    ("com.jetbrains.pycharm", "PyCharm"),
-    ("com.jetbrains.WebStorm", "WebStorm"),
-    ("com.jetbrains.goland", "GoLand"),
-    ("com.jetbrains.rubymine", "RubyMine"),
-    ("com.jetbrains.clion", "CLion"),
-    ("com.jetbrains.phpstorm", "PhpStorm"),
-    ("com.jetbrains.rustrover", "RustRover"),
-    ("com.jetbrains.datagrip", "DataGrip"),
-    ("com.jetbrains.aqua", "Aqua"),
-    ("com.apple.Terminal", "Terminal"),
-    ("com.googlecode.iterm2", "iTerm2"),
-    ("dev.warp.Warp-Stable", "Warp"),
-    ("com.mitchellh.ghostty", "Ghostty"),
-    ("net.kovidgoyal.kitty", "Kitty"),
-    ("org.alacritty.Alacritty", "Alacritty"),
-    ("co.zeit.hyper", "Hyper"),
-    ("com.raphaelamorim.tabby", "Tabby"),
-    ("com.github.wez.wezterm", "WezTerm"),
+/// A host app devsignal can name and illustrate.
+///
+/// `image` is the stem of the file in `assets/discord/hosts/`, which is also the art-asset key to
+/// upload under `mode = "key"`. A core test asserts every stem here exists on disk, so adding a
+/// host without its icon fails the build rather than showing a blank circle in Discord.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostApp {
+    pub bundle_id: &'static str,
+    pub label: &'static str,
+    pub image: &'static str,
+}
+
+const fn host(bundle_id: &'static str, label: &'static str, image: &'static str) -> HostApp {
+    HostApp {
+        bundle_id,
+        label,
+        image,
+    }
+}
+
+/// Known bundle id → short label + icon (editors, terminals, JetBrains SKUs).
+pub const HOST_APPS: &[HostApp] = &[
+    host(
+        "com.anthropic.claudefordesktop",
+        "Claude Desktop",
+        "claude_desktop",
+    ),
+    host("com.todesktop.230313mzl4w4u92", "Cursor", "cursor"),
+    host("com.microsoft.VSCode", "VS Code", "vs_code"),
+    host("com.vscodium", "VSCodium", "vscodium"),
+    host("dev.zed.Zed", "Zed", "zed"),
+    host("com.apple.dt.Xcode", "Xcode", "xcode"),
+    host("com.sublimetext.4", "Sublime Text", "sublime_text"),
+    host("com.sublimetext.3", "Sublime Text", "sublime_text"),
+    host("com.panic.Nova", "Nova", "nova"),
+    host("com.jetbrains.fleet", "Fleet", "fleet"),
+    host("com.jetbrains.intellij", "IntelliJ IDEA", "intellij_idea"),
+    host("com.jetbrains.pycharm", "PyCharm", "pycharm"),
+    host("com.jetbrains.WebStorm", "WebStorm", "webstorm"),
+    host("com.jetbrains.goland", "GoLand", "goland"),
+    host("com.jetbrains.rubymine", "RubyMine", "rubymine"),
+    host("com.jetbrains.clion", "CLion", "clion"),
+    host("com.jetbrains.phpstorm", "PhpStorm", "phpstorm"),
+    host("com.jetbrains.rustrover", "RustRover", "rustrover"),
+    host("com.jetbrains.datagrip", "DataGrip", "datagrip"),
+    host("com.jetbrains.aqua", "Aqua", "aqua"),
+    host("com.apple.Terminal", "Terminal", "terminal"),
+    host("com.googlecode.iterm2", "iTerm2", "iterm2"),
+    host("dev.warp.Warp-Stable", "Warp", "warp"),
+    host("com.mitchellh.ghostty", "Ghostty", "ghostty"),
+    host("net.kovidgoyal.kitty", "Kitty", "kitty"),
+    host("org.alacritty.Alacritty", "Alacritty", "alacritty"),
+    host("co.zeit.hyper", "Hyper", "hyper"),
+    host("com.raphaelamorim.tabby", "Tabby", "tabby"),
+    host("com.github.wez.wezterm", "WezTerm", "wezterm"),
 ];
+
+/// Icon used when the frontmost app is unknown — also the label `macOS` falls back to.
+pub const UNKNOWN_HOST_IMAGE: &str = "macos";
+
+/// Every distinct host icon stem, for the `init` wizard's upload list under `mode = "key"`.
+///
+/// Includes the two stems only [`host_image_for_bundle`]'s prefix heuristics can produce, which are
+/// otherwise absent from [`HOST_APPS`].
+pub fn host_image_keys() -> Vec<String> {
+    let mut keys = vec![
+        UNKNOWN_HOST_IMAGE.to_string(),
+        "jetbrains".to_string(),
+        "android_studio".to_string(),
+    ];
+    for app in HOST_APPS {
+        if !keys.iter().any(|k| k == app.image) {
+            keys.push(app.image.to_string());
+        }
+    }
+    keys
+}
+
+fn host_app_for_bundle(bundle_id: &str) -> Option<&'static HostApp> {
+    HOST_APPS.iter().find(|app| app.bundle_id == bundle_id)
+}
 
 /// Map common macOS bundle IDs to a short host label for Discord `state`.
 /// Covers Tier A/B editors plus common terminals (Tier C).
 pub fn host_label_for_bundle(bundle_id: &str) -> String {
-    for (id, label) in HOST_BUNDLE_LABELS {
-        if *id == bundle_id {
-            return (*label).to_string();
-        }
+    if let Some(app) = host_app_for_bundle(bundle_id) {
+        return app.label.to_string();
     }
     if bundle_id.starts_with("com.jetbrains.") || bundle_id.contains("jetbrains") {
         return "JetBrains".to_string();
@@ -650,6 +960,26 @@ pub fn host_label_for_bundle(bundle_id: &str) -> String {
         return "Android Studio".to_string();
     }
     bundle_id.to_string()
+}
+
+/// Icon stem for a host, following the same prefix heuristics as [`host_label_for_bundle`].
+///
+/// Unknown apps get [`UNKNOWN_HOST_IMAGE`] rather than nothing: a raw bundle id would resolve to a
+/// 404 in url mode and a blank circle in key mode.
+pub fn host_image_for_bundle(bundle_id: Option<&str>) -> &'static str {
+    let Some(bundle_id) = bundle_id else {
+        return UNKNOWN_HOST_IMAGE;
+    };
+    if let Some(app) = host_app_for_bundle(bundle_id) {
+        return app.image;
+    }
+    if bundle_id.starts_with("com.jetbrains.") || bundle_id.contains("jetbrains") {
+        return "jetbrains";
+    }
+    if bundle_id.starts_with("com.google.android.studio") {
+        return "android_studio";
+    }
+    UNKNOWN_HOST_IMAGE
 }
 
 fn contains_ignore_ascii_case(items: &[String], needle: &str) -> bool {
@@ -821,43 +1151,125 @@ pub fn select_active_agent(mut matches: Vec<(AgentRule, u32)>) -> Option<(Active
     Some((agent, pid))
 }
 
-pub fn build_presence_view(
+/// Everything outside the config that shapes one presence payload.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PresenceInputs<'a> {
+    pub agent: Option<&'a ActiveAgent>,
+    /// `None` when the frontmost app could not be determined; renders as `macOS`.
+    pub host_bundle_id: Option<&'a str>,
+    /// Suppress the host entirely — `platforms.disabled_hosts`, or a rule's `then.hide_host`. Also
+    /// suppresses the host icon, so hiding the label does not leak the app through its image.
+    pub hide_host: bool,
+    pub session_start_unix: Option<u64>,
+    pub cwd_basename: Option<&'a str>,
+}
+
+/// Render one line slot. `host` is `None` when the host is unknown *or* deliberately hidden; the
+/// two cases differ only in that a hidden host still gets a neutral `Working`.
+fn render_line(
     cfg: &Config,
-    agent: Option<&ActiveAgent>,
-    host_bundle_id: Option<&str>,
-    session_start_unix: Option<u64>,
-    cwd_basename: Option<&str>,
-) -> PresenceView {
-    let host = host_bundle_id
-        .map(host_label_for_bundle)
-        .unwrap_or_else(|| "macOS".to_string());
+    line: PresenceLine,
+    input: &PresenceInputs<'_>,
+    host: Option<&str>,
+    project_has_own_line: bool,
+) -> Option<String> {
+    let active = input.agent.is_some();
+    let project = input.cwd_basename.filter(|s| !s.is_empty());
+    // The project rides along with the host label unless it already occupies a line of its own.
+    let suffix = match project {
+        Some(p) if !project_has_own_line => format!(" · {p}"),
+        _ => String::new(),
+    };
 
-    let cwd_suffix = cwd_basename
-        .filter(|s| !s.is_empty())
-        .map(|s| format!(" · {s}"))
-        .unwrap_or_default();
+    match line {
+        PresenceLine::Agent => Some(match input.agent {
+            Some(a) => a.label.clone(),
+            None => "Idle".to_string(),
+        }),
+        PresenceLine::Host => Some(match (host, active) {
+            (Some(host), true) => format!("In {host}{suffix}"),
+            (Some(host), false) => format!("{host} · no agent CLI detected"),
+            // Hidden host: say something true without naming the app.
+            (None, true) => format!("Working{suffix}"),
+            (None, false) => "No agent CLI detected".to_string(),
+        }),
+        PresenceLine::Project => project.map(str::to_string),
+        PresenceLine::Brand => {
+            Some(cfg.presence.brand_text.trim().to_string()).filter(|brand| !brand.is_empty())
+        }
+        PresenceLine::Off => None,
+    }
+}
 
-    match agent {
-        Some(a) => PresenceView {
-            details: a.label.clone(),
-            state: format!("In {host}{cwd_suffix}"),
-            large_image: a.large_image.clone(),
-            large_text: cfg.discord.large_text.clone(),
-            small_image: a.small_image.clone(),
-            small_text: a.small_text.clone(),
-            buttons: a.buttons.clone(),
-            start_timestamp_unix: session_start_unix,
-        },
-        None => PresenceView {
-            details: "Idle".to_string(),
-            state: format!("{host} · no agent CLI detected"),
-            large_image: cfg.discord.large_image.clone(),
-            large_text: cfg.discord.large_text.clone(),
-            small_image: cfg.discord.small_image.clone(),
-            small_text: cfg.discord.small_text.clone(),
-            buttons: vec![],
-            start_timestamp_unix: None,
-        },
+pub fn build_presence_view(cfg: &Config, input: &PresenceInputs<'_>) -> PresenceView {
+    let host_label = if input.hide_host {
+        None
+    } else {
+        Some(
+            input
+                .host_bundle_id
+                .map(host_label_for_bundle)
+                .unwrap_or_else(|| "macOS".to_string()),
+        )
+    };
+    let project_has_own_line = cfg.presence.uses(PresenceLine::Project);
+    let line = |slot: PresenceLine| {
+        render_line(
+            cfg,
+            slot,
+            input,
+            host_label.as_deref(),
+            project_has_own_line,
+        )
+    };
+
+    // Agent art when an agent is active, the idle art otherwise.
+    let (large_image, agent_small) = match input.agent {
+        Some(a) => (
+            a.large_image.clone(),
+            (a.small_image.clone(), a.small_text.clone()),
+        ),
+        None => (
+            cfg.discord.large_image.clone(),
+            (
+                cfg.discord.small_image.clone(),
+                cfg.discord.small_text.clone(),
+            ),
+        ),
+    };
+
+    // The host icon owns the small slot when enabled, since it is the only place the editor or
+    // terminal can appear as an image. The agent's own small image is the fallback.
+    let host_icon = match (cfg.images.host_icon, host_label.as_deref()) {
+        (true, Some(label)) => Some((
+            cfg.images.resolve(
+                ImageFolder::Hosts,
+                host_image_for_bundle(input.host_bundle_id),
+            ),
+            label.to_string(),
+        )),
+        _ => None,
+    };
+    let (small_image, small_text) = match host_icon {
+        Some((image, label)) => (Some(image), Some(label)),
+        None => (
+            agent_small
+                .0
+                .map(|key| cfg.images.resolve(ImageFolder::Agents, &key)),
+            agent_small.1,
+        ),
+    };
+
+    PresenceView {
+        name: line(cfg.presence.name),
+        details: line(cfg.presence.details),
+        state: line(cfg.presence.state),
+        large_image: cfg.images.resolve(ImageFolder::Agents, &large_image),
+        large_text: cfg.discord.large_text.clone(),
+        small_image,
+        small_text,
+        buttons: input.agent.map(|a| a.buttons.clone()).unwrap_or_default(),
+        start_timestamp_unix: input.session_start_unix.filter(|_| input.agent.is_some()),
     }
 }
 
@@ -873,6 +1285,8 @@ mod tests {
             min_push_interval_secs: 20,
             idle_mode: IdleMode::Status,
             show_cwd_basename: false,
+            presence: PresenceSection::default(),
+            images: ImagesConfig::default(),
             discord: DiscordSection {
                 client_id: "123".to_string(),
                 large_image: "devsignal".to_string(),
@@ -1255,6 +1669,265 @@ mod tests {
         }
     }
 
+    fn assets_dir() -> PathBuf {
+        // crates/devsignal-core -> repo root.
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/discord")
+            .canonicalize()
+            .expect("assets/discord must exist")
+    }
+
+    /// Drift guard: url mode turns these names straight into `raw.githubusercontent.com` paths, so a
+    /// name with no PNG behind it is a 404 in Discord — and in key mode, a blank circle. Either way
+    /// the daemon looks broken with nothing in the logs, which is the failure mode all the other
+    /// validation exists to avoid.
+    #[test]
+    fn every_host_icon_name_has_a_png() {
+        let hosts = assets_dir().join("hosts");
+        for name in host_image_keys() {
+            let path = hosts.join(format!("{name}.png"));
+            assert!(
+                path.exists(),
+                "missing {}; run python3 scripts/build-discord-assets.py",
+                path.display()
+            );
+        }
+        for app in HOST_APPS {
+            assert!(
+                hosts.join(format!("{}.png", app.image)).exists(),
+                "host {} references icon {:?} with no PNG",
+                app.bundle_id,
+                app.image
+            );
+        }
+    }
+
+    #[test]
+    fn every_preset_agent_image_has_a_png() {
+        let agents = assets_dir().join("agents");
+        for name in preset_asset_keys() {
+            let path = agents.join(format!("{name}.png"));
+            assert!(
+                path.exists(),
+                "missing {}; run python3 scripts/build-discord-assets.py",
+                path.display()
+            );
+        }
+    }
+
+    /// The heuristic branches of `host_image_for_bundle` are the ones with no table entry to keep
+    /// them honest, so they get asserted explicitly.
+    #[test]
+    fn host_image_falls_back_before_it_returns_nothing() {
+        assert_eq!(
+            host_image_for_bundle(Some("com.mitchellh.ghostty")),
+            "ghostty"
+        );
+        assert_eq!(
+            host_image_for_bundle(Some("com.jetbrains.unknown")),
+            "jetbrains"
+        );
+        assert_eq!(
+            host_image_for_bundle(Some("com.google.android.studio.preview")),
+            "android_studio"
+        );
+        assert_eq!(host_image_for_bundle(Some("com.example.unknown")), "macos");
+        assert_eq!(host_image_for_bundle(None), "macos");
+    }
+
+    #[test]
+    fn url_mode_expands_names_and_passes_absolute_urls_through() {
+        let images = ImagesConfig {
+            mode: ImageMode::Url,
+            base_url: "https://example.test/assets/".to_string(),
+            host_icon: true,
+        };
+        // The trailing slash must not double up.
+        assert_eq!(
+            images.resolve(ImageFolder::Agents, "claude_code"),
+            "https://example.test/assets/agents/claude_code.png"
+        );
+        assert_eq!(
+            images.resolve(ImageFolder::Hosts, "ghostty"),
+            "https://example.test/assets/hosts/ghostty.png"
+        );
+        // An agent pointing at its own art stays untouched, in either mode.
+        assert_eq!(
+            images.resolve(ImageFolder::Agents, "https://cdn.test/x.png"),
+            "https://cdn.test/x.png"
+        );
+        let keys = ImagesConfig::default();
+        assert_eq!(
+            keys.resolve(ImageFolder::Agents, "claude_code"),
+            "claude_code"
+        );
+        assert_eq!(
+            keys.resolve(ImageFolder::Agents, "https://cdn.test/x.png"),
+            "https://cdn.test/x.png"
+        );
+    }
+
+    #[test]
+    fn default_images_and_presence_preserve_the_original_payload() {
+        let images = ImagesConfig::default();
+        assert_eq!(images.mode, ImageMode::Key);
+        assert!(!images.host_icon, "host icons need uploads in key mode");
+        let presence = PresenceSection::default();
+        assert_eq!(presence.name, PresenceLine::Off);
+        assert_eq!(presence.details, PresenceLine::Agent);
+        assert_eq!(presence.state, PresenceLine::Host);
+    }
+
+    #[test]
+    fn validate_rejects_project_line_without_show_cwd_basename() {
+        let mut cfg = valid_config();
+        cfg.presence.state = PresenceLine::Project;
+        cfg.show_cwd_basename = false;
+        let msg = err_of(&cfg);
+        assert!(msg.contains("show_cwd_basename"), "got {msg}");
+
+        cfg.show_cwd_basename = true;
+        cfg.validate()
+            .expect("project line is fine with the flag on");
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_lines_and_empty_brand_text() {
+        let mut cfg = valid_config();
+        cfg.presence.name = PresenceLine::Agent;
+        cfg.presence.details = PresenceLine::Agent;
+        let msg = err_of(&cfg);
+        assert!(msg.contains("two lines"), "got {msg}");
+
+        let mut cfg = valid_config();
+        cfg.presence.state = PresenceLine::Brand;
+        cfg.presence.brand_text = "  ".into();
+        assert!(err_of(&cfg).contains("brand_text"));
+    }
+
+    #[test]
+    fn validate_rejects_a_base_url_that_is_not_http() {
+        let mut cfg = valid_config();
+        cfg.images.mode = ImageMode::Url;
+        cfg.images.base_url = "assets/discord".into();
+        let msg = err_of(&cfg);
+        assert!(msg.contains("base_url"), "got {msg}");
+        // Key mode never reads base_url, so it must not be validated there.
+        cfg.images.mode = ImageMode::Key;
+        cfg.validate().expect("key mode ignores base_url");
+    }
+
+    /// Every slot, in the agent-first arrangement plus a project line, so the interaction that
+    /// matters is asserted: the project stops being appended to the host once it has its own line.
+    #[test]
+    fn project_line_replaces_the_host_suffix() {
+        let mut cfg = sample_config();
+        cfg.show_cwd_basename = true;
+        cfg.presence = PresenceSection {
+            name: PresenceLine::Agent,
+            details: PresenceLine::Host,
+            state: PresenceLine::Project,
+            brand_text: "devsignal".into(),
+        };
+        let agent = ActiveAgent {
+            id: "claude_code".into(),
+            label: "Claude Code".into(),
+            large_image: "claude_code".into(),
+            small_image: None,
+            small_text: None,
+            buttons: vec![],
+        };
+        let v = build_presence_view(
+            &cfg,
+            &PresenceInputs {
+                agent: Some(&agent),
+                host_bundle_id: Some("com.mitchellh.ghostty"),
+                cwd_basename: Some("devsignal"),
+                ..PresenceInputs::default()
+            },
+        );
+        assert_eq!(v.name.as_deref(), Some("Claude Code"));
+        assert_eq!(v.details.as_deref(), Some("In Ghostty"));
+        assert_eq!(v.state.as_deref(), Some("devsignal"));
+
+        // Without a project line the basename rides along with the host, as it always has.
+        cfg.presence.state = PresenceLine::Brand;
+        let v = build_presence_view(
+            &cfg,
+            &PresenceInputs {
+                agent: Some(&agent),
+                host_bundle_id: Some("com.mitchellh.ghostty"),
+                cwd_basename: Some("devsignal"),
+                ..PresenceInputs::default()
+            },
+        );
+        assert_eq!(v.details.as_deref(), Some("In Ghostty · devsignal"));
+    }
+
+    /// `off` must omit the line rather than send an empty string, which Discord renders as a blank
+    /// row in the card.
+    #[test]
+    fn off_omits_the_line() {
+        let mut cfg = sample_config();
+        cfg.presence.details = PresenceLine::Off;
+        cfg.presence.state = PresenceLine::Off;
+        let v = build_presence_view(&cfg, &PresenceInputs::default());
+        assert_eq!(v.name, None);
+        assert_eq!(v.details, None);
+        assert_eq!(v.state, None);
+    }
+
+    #[test]
+    fn host_icon_takes_the_small_slot_and_names_the_host() {
+        let mut cfg = sample_config();
+        cfg.images = ImagesConfig {
+            mode: ImageMode::Url,
+            base_url: "https://example.test/a".into(),
+            host_icon: true,
+        };
+        let agent = ActiveAgent {
+            id: "claude_code".into(),
+            label: "Claude Code".into(),
+            large_image: "claude_code".into(),
+            small_image: Some("devsignal".into()),
+            small_text: Some("devsignal".into()),
+            buttons: vec![],
+        };
+        let v = build_presence_view(
+            &cfg,
+            &PresenceInputs {
+                agent: Some(&agent),
+                host_bundle_id: Some("com.googlecode.iterm2"),
+                ..PresenceInputs::default()
+            },
+        );
+        assert_eq!(
+            v.large_image,
+            "https://example.test/a/agents/claude_code.png"
+        );
+        assert_eq!(
+            v.small_image.as_deref(),
+            Some("https://example.test/a/hosts/iterm2.png")
+        );
+        assert_eq!(v.small_text.as_deref(), Some("iTerm2"));
+
+        // With host icons off, the agent's own small image comes back — resolved, not raw.
+        cfg.images.host_icon = false;
+        let v = build_presence_view(
+            &cfg,
+            &PresenceInputs {
+                agent: Some(&agent),
+                host_bundle_id: Some("com.googlecode.iterm2"),
+                ..PresenceInputs::default()
+            },
+        );
+        assert_eq!(
+            v.small_image.as_deref(),
+            Some("https://example.test/a/agents/devsignal.png")
+        );
+        assert_eq!(v.small_text.as_deref(), Some("devsignal"));
+    }
+
     /// Extract every ```toml fenced block from a markdown document.
     fn toml_fences(markdown: &str) -> Vec<String> {
         let mut out = Vec::new();
@@ -1509,16 +2182,7 @@ mod tests {
     #[test]
     fn debouncer_equal_payload_suppressed() {
         let mut d = Debouncer::new(Duration::from_millis(100));
-        let v = PresenceView {
-            details: "A".into(),
-            state: "B".into(),
-            large_image: "x".into(),
-            large_text: "".into(),
-            small_image: None,
-            small_text: None,
-            buttons: vec![],
-            start_timestamp_unix: None,
-        };
+        let v = view_named("A");
         assert!(d.should_push(&v, true));
         assert!(!d.should_push(&v, false));
     }
@@ -1526,26 +2190,8 @@ mod tests {
     #[test]
     fn debouncer_new_payload_before_min_interval_suppressed() {
         let mut d = Debouncer::new(Duration::from_millis(400));
-        let a = PresenceView {
-            details: "A".into(),
-            state: "s".into(),
-            large_image: "x".into(),
-            large_text: "".into(),
-            small_image: None,
-            small_text: None,
-            buttons: vec![],
-            start_timestamp_unix: None,
-        };
-        let b = PresenceView {
-            details: "B".into(),
-            state: "s".into(),
-            large_image: "x".into(),
-            large_text: "".into(),
-            small_image: None,
-            small_text: None,
-            buttons: vec![],
-            start_timestamp_unix: None,
-        };
+        let a = view_named("A");
+        let b = view_named("B");
         assert!(d.should_push(&a, true));
         assert!(!d.should_push(&b, false));
         std::thread::sleep(Duration::from_millis(450));
@@ -1554,8 +2200,9 @@ mod tests {
 
     fn view_named(details: &str) -> PresenceView {
         PresenceView {
-            details: details.into(),
-            state: "s".into(),
+            name: None,
+            details: Some(details.into()),
+            state: Some("s".into()),
             large_image: "x".into(),
             large_text: String::new(),
             small_image: None,
@@ -1656,16 +2303,7 @@ mod tests {
     #[test]
     fn debouncer_force_always_pushes() {
         let mut d = Debouncer::new(Duration::from_secs(60));
-        let v = PresenceView {
-            details: "A".into(),
-            state: "s".into(),
-            large_image: "x".into(),
-            large_text: "".into(),
-            small_image: None,
-            small_text: None,
-            buttons: vec![],
-            start_timestamp_unix: None,
-        };
+        let v = view_named("A");
         assert!(d.should_push(&v, true));
         assert!(d.should_push(&v, true));
     }
@@ -1699,21 +2337,26 @@ mod tests {
         };
         let v = build_presence_view(
             &cfg,
-            Some(&agent),
-            Some("com.microsoft.VSCode"),
-            Some(99),
-            Some("proj"),
+            &PresenceInputs {
+                agent: Some(&agent),
+                host_bundle_id: Some("com.microsoft.VSCode"),
+                session_start_unix: Some(99),
+                cwd_basename: Some("proj"),
+                ..PresenceInputs::default()
+            },
         );
-        assert_eq!(v.details, "My Agent");
-        assert_eq!(v.state, "In VS Code · proj");
+        // The default layout leaves line 1 to Discord: the application's own name.
+        assert_eq!(v.name, None);
+        assert_eq!(v.details.as_deref(), Some("My Agent"));
+        assert_eq!(v.state.as_deref(), Some("In VS Code · proj"));
         assert_eq!(v.large_image, "img");
         assert_eq!(v.start_timestamp_unix, Some(99));
         assert!(v.small_image.is_none());
         assert!(v.buttons.is_empty());
 
-        let idle = build_presence_view(&cfg, None, None, None, None);
-        assert_eq!(idle.details, "Idle");
-        assert_eq!(idle.state, "macOS · no agent CLI detected");
+        let idle = build_presence_view(&cfg, &PresenceInputs::default());
+        assert_eq!(idle.details.as_deref(), Some("Idle"));
+        assert_eq!(idle.state.as_deref(), Some("macOS · no agent CLI detected"));
         assert_eq!(idle.large_image, cfg.discord.large_image);
         assert!(idle.start_timestamp_unix.is_none());
         assert!(idle.buttons.is_empty());
@@ -1765,12 +2408,10 @@ mod tests {
 
     #[test]
     fn host_bundle_labels_include_hyper_tabby_wezterm() {
-        assert!(HOST_BUNDLE_LABELS
+        assert!(HOST_APPS.iter().any(|a| a.bundle_id == "co.zeit.hyper"));
+        assert!(HOST_APPS
             .iter()
-            .any(|(id, _)| *id == "co.zeit.hyper"));
-        assert!(HOST_BUNDLE_LABELS
-            .iter()
-            .any(|(id, _)| *id == "com.github.wez.wezterm"));
+            .any(|a| a.bundle_id == "com.github.wez.wezterm"));
     }
 
     #[test]
@@ -1905,7 +2546,13 @@ mod tests {
                 url: "https://claude.ai/code".into(),
             }],
         };
-        let v = build_presence_view(&cfg, Some(&agent), None, None, None);
+        let v = build_presence_view(
+            &cfg,
+            &PresenceInputs {
+                agent: Some(&agent),
+                ..PresenceInputs::default()
+            },
+        );
         assert_eq!(v.small_image.as_deref(), Some("devsignal"));
         assert_eq!(v.small_text.as_deref(), Some("devsignal v0.2"));
         assert_eq!(v.buttons.len(), 1);
@@ -1918,7 +2565,7 @@ mod tests {
         let mut cfg = sample_config();
         cfg.discord.small_image = Some("idle_icon".into());
         cfg.discord.small_text = Some("No agent".into());
-        let v = build_presence_view(&cfg, None, None, None, None);
+        let v = build_presence_view(&cfg, &PresenceInputs::default());
         assert_eq!(v.small_image.as_deref(), Some("idle_icon"));
         assert_eq!(v.small_text.as_deref(), Some("No agent"));
         assert!(v.buttons.is_empty());
@@ -1935,7 +2582,13 @@ mod tests {
             small_text: None,
             buttons: vec![],
         };
-        let v = build_presence_view(&cfg, Some(&agent), None, None, None);
+        let v = build_presence_view(
+            &cfg,
+            &PresenceInputs {
+                agent: Some(&agent),
+                ..PresenceInputs::default()
+            },
+        );
         assert!(v.small_image.is_none());
         assert!(v.small_text.is_none());
         assert!(v.buttons.is_empty());

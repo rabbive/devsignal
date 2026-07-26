@@ -3,7 +3,8 @@ use chrono::Timelike;
 use devsignal_core::{
     agent_allowed, apply_rules, build_presence_view, host_allowed, host_label_for_bundle,
     process_matches_rule, redact_cwd_basename, select_active_agent, ActiveAgent, AgentRule, Config,
-    Debouncer, IdleMode, PresenceAction, PresencePolicyOverride, PresenceView, RuleContext,
+    Debouncer, IdleMode, ImageMode, PresenceAction, PresenceInputs, PresencePolicyOverride,
+    PresenceView, RuleContext,
 };
 use devsignal_discord::PresenceSession;
 use std::io::IsTerminal;
@@ -24,6 +25,11 @@ use sink::{DiscordSink, PresenceSink, StdoutSink};
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
+/// Stand-ins used by `detect` for the two ways a line can be absent: `presence.name = "off"` hands
+/// line 1 back to Discord, while any other slot set to `off` drops its line entirely.
+const APP_NAME_PLACEHOLDER: &str = "<Discord application name>";
+const OMITTED: &str = "<omitted>";
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -34,17 +40,6 @@ fn now_unix() -> u64 {
 fn local_minutes_now() -> u16 {
     let now = chrono::Local::now();
     (now.hour() as u16) * 60 + now.minute() as u16
-}
-
-fn hidden_host_state(active: bool, cwd_basename: Option<&str>) -> String {
-    if active {
-        cwd_basename
-            .filter(|s| !s.is_empty())
-            .map(|s| format!("Working · {s}"))
-            .unwrap_or_else(|| "Working".to_string())
-    } else {
-        "No agent CLI detected".to_string()
-    }
 }
 
 /// Only the process fields devsignal actually reads. `nothing()` still yields pid, parent, name,
@@ -153,15 +148,19 @@ fn build_policy_view(
         local_minutes,
     };
     let policy = apply_rules(cfg, &ctx);
-    let hide_host = !host_is_allowed || policy.hide_host;
-    let visible_host = if hide_host { None } else { host_bundle_id };
 
-    let mut view = build_presence_view(cfg, agent, visible_host, session_start_unix, cwd_basename);
-    if hide_host && policy.state.is_none() {
-        view.state = hidden_host_state(agent.is_some(), cwd_basename);
-    }
+    let mut view = build_presence_view(
+        cfg,
+        &PresenceInputs {
+            agent,
+            host_bundle_id,
+            hide_host: !host_is_allowed || policy.hide_host,
+            session_start_unix,
+            cwd_basename,
+        },
+    );
     if let Some(state) = policy.state.clone() {
-        view.state = state;
+        view.state = Some(state);
     }
     (view, policy)
 }
@@ -217,6 +216,21 @@ fn cmd_validate(config_path: &Path) -> Result<()> {
     println!(
         "idle_mode: {:?}  show_cwd_basename: {}  poll: {}s  min_push: {}s",
         cfg.idle_mode, cfg.show_cwd_basename, cfg.poll_interval_secs, cfg.min_push_interval_secs
+    );
+    // The card, top line first, so a layout mistake is visible without starting the daemon.
+    println!(
+        "lines: name={:?} details={:?} state={:?}  (name=off means Discord shows the app name)",
+        cfg.presence.name, cfg.presence.details, cfg.presence.state
+    );
+    println!(
+        "images: mode={:?} host_icon={}{}",
+        cfg.images.mode,
+        cfg.images.host_icon,
+        if cfg.images.mode == ImageMode::Url {
+            format!("  base_url={}", cfg.images.base_url)
+        } else {
+            String::new()
+        }
     );
 
     for a in &cfg.agents {
@@ -451,8 +465,18 @@ fn cmd_detect(config_path: &Path, scope: DetectScope) -> Result<()> {
             cwd.as_deref(),
             Some(local_minutes_now()),
         );
-        println!("  details: {}", view.details);
-        println!("  state:   {}", view.state);
+        // In card order: name is line 1, details line 2, state line 3.
+        println!(
+            "  name:    {}",
+            view.name.as_deref().unwrap_or(APP_NAME_PLACEHOLDER)
+        );
+        println!("  details: {}", view.details.as_deref().unwrap_or(OMITTED));
+        println!("  state:   {}", view.state.as_deref().unwrap_or(OMITTED));
+        println!("  large_image: {}", view.large_image);
+        println!(
+            "  small_image: {}",
+            view.small_image.as_deref().unwrap_or(OMITTED)
+        );
         match policy.matched_rule_name.as_deref() {
             Some(name) => println!("  matched rule: {name}"),
             None if cfg.rules.is_empty() => {
@@ -694,15 +718,16 @@ fn run_forever(mut state: RunState) {
             .should_send(PresenceAction::Set(&view), force)
         {
             debug!(
-                details = %view.details,
-                state = %view.state,
+                name = ?view.name,
+                details = ?view.details,
+                state = ?view.state,
                 matched_rule = ?policy.matched_rule_name,
                 "pushing presence"
             );
             state.sink.set(&view);
         } else if force {
             warn!(
-                details = %view.details,
+                details = ?view.details,
                 "presence update suppressed by the Discord rate limit; is an agent process flapping?"
             );
         }
@@ -720,12 +745,107 @@ fn run_forever(mut state: RunState) {
 mod tests {
     use super::*;
 
+    fn test_config(extra: &str) -> Config {
+        let toml = format!(
+            "{extra}\n[discord]\nclient_id = \"1\"\n\n\
+             [[agents]]\nid = \"claude_code\"\nprocess_names = [\"claude\"]\n"
+        );
+        toml::from_str(&toml).expect("test config parses")
+    }
+
+    fn test_agent() -> ActiveAgent {
+        ActiveAgent {
+            id: "claude_code".into(),
+            label: "Claude Code".into(),
+            large_image: "claude_code".into(),
+            small_image: None,
+            small_text: None,
+            buttons: vec![],
+        }
+    }
+
+    /// `hide_host` has to survive both routes into it — a rule's `then`, and
+    /// `platforms.disabled_hosts` — and neither may leak the app name it is hiding.
     #[test]
-    fn hidden_host_state_covers_active_idle_and_project() {
-        assert_eq!(hidden_host_state(true, None), "Working");
-        assert_eq!(hidden_host_state(true, Some("myrepo")), "Working · myrepo");
-        assert_eq!(hidden_host_state(true, Some("")), "Working");
-        assert_eq!(hidden_host_state(false, Some("x")), "No agent CLI detected");
+    fn hide_host_replaces_the_host_line_from_rule_or_platforms() {
+        let agent = test_agent();
+        let ghostty = Some("com.mitchellh.ghostty");
+
+        let by_rule = test_config(
+            "show_cwd_basename = true\n\n\
+             [[rules]]\nname = \"private\"\nthen = { hide_host = true }\n",
+        );
+        let (view, policy) = build_policy_view(
+            &by_rule,
+            Some(&agent),
+            ghostty,
+            None,
+            Some("myrepo"),
+            Some(600),
+        );
+        assert_eq!(policy.matched_rule_name.as_deref(), Some("private"));
+        assert_eq!(view.state.as_deref(), Some("Working · myrepo"));
+
+        let by_platforms =
+            test_config("[platforms]\ndisabled_hosts = [\"com.mitchellh.ghostty\"]\n");
+        let (view, _) = build_policy_view(&by_platforms, Some(&agent), ghostty, None, None, None);
+        assert_eq!(view.state.as_deref(), Some("Working"));
+
+        // Idle with the host hidden still has to say something true.
+        let (idle, _) = build_policy_view(&by_platforms, None, ghostty, None, None, None);
+        assert_eq!(idle.state.as_deref(), Some("No agent CLI detected"));
+    }
+
+    /// Hiding the host label must hide its icon too, or `hide_host` leaks the app through the
+    /// small image instead of the text.
+    #[test]
+    fn hide_host_also_suppresses_the_host_icon() {
+        let agent = test_agent();
+        let cfg = test_config(
+            "[images]\nmode = \"url\"\nhost_icon = true\n\n\
+             [platforms]\ndisabled_hosts = [\"com.mitchellh.ghostty\"]\n",
+        );
+        let (shown, _) = build_policy_view(
+            &cfg,
+            Some(&agent),
+            Some("com.apple.Terminal"),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            shown.small_image.as_deref(),
+            Some("https://raw.githubusercontent.com/rabbive/devsignal/main/assets/discord/hosts/terminal.png")
+        );
+
+        let (hidden, _) = build_policy_view(
+            &cfg,
+            Some(&agent),
+            Some("com.mitchellh.ghostty"),
+            None,
+            None,
+            None,
+        );
+        assert!(hidden.small_image.is_none());
+        assert!(hidden.small_text.is_none());
+    }
+
+    /// The reordering this exists for: agent on line 1, host on line 2, brand on line 3.
+    #[test]
+    fn agent_first_layout_moves_the_agent_to_line_one() {
+        let cfg =
+            test_config("[presence]\nname = \"agent\"\ndetails = \"host\"\nstate = \"brand\"\n");
+        let (view, _) = build_policy_view(
+            &cfg,
+            Some(&test_agent()),
+            Some("com.mitchellh.ghostty"),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(view.name.as_deref(), Some("Claude Code"));
+        assert_eq!(view.details.as_deref(), Some("In Ghostty"));
+        assert_eq!(view.state.as_deref(), Some("devsignal"));
     }
 
     #[test]
