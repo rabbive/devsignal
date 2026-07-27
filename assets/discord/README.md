@@ -5,7 +5,19 @@
 ```
 agents/<agent id>.png     # large image — claude_code.png, codex.png, …
 hosts/<image slug>.png    # small corner icon — ghostty.png, vs_code.png, …
+overrides/                # optional: your own art, wins over anything generated
 ```
+
+Each app wears **its own logo** — the real multi-colour marks (VS Code's ribbon, the JetBrains SKU
+tiles, Xcode's hammer, Ghostty's ghost), not one-colour silhouettes. What makes them a *set* is the
+treatment around them, applied identically to all 45:
+
+| | |
+| --- | --- |
+| tile | 512×512, 22% corner radius, tinted 16% toward that logo's own dominant colour, 6px ring at 40% |
+| glyph | 56% of the tile, centred — it has to survive Discord cropping the small slot to a circle |
+| polarity | a mark that is essentially black (Cursor, Apple, OpenAI, Copilot, Terminal, Hyper, iTerm2) gets a **light** tile; everything else gets a dark one, decided by measured luminance rather than by hand |
+| monogram | the eight apps with no logo in any CC0/MIT set (Kitty, Tabby, Nova, RustRover, Amp, Aider, Crush, Goose) get initials in the same tile, so they read as deliberate rather than missing |
 
 The names are not decorative: `agents/<id>.png` is keyed by the `[[agents]] id`, and
 `hosts/<slug>.png` by the `image` field of `HOST_APPS` in `devsignal-core`. Two tests
@@ -48,15 +60,41 @@ Edit the `AGENTS` / `HOSTS` tables in that script to add an icon. Adding a host 
 its `HostApp` entry in `devsignal-core`; adding an agent means `agent_presets()` and
 `config.example.toml`. The drift tests enforce both directions.
 
+## Using a different icon pack
+
+Drop your own file into `overrides/` and it is used verbatim — no code change, no table edit:
+
+```
+assets/discord/overrides/hosts/ghostty.png     # or .svg; any size, resized to 512
+assets/discord/overrides/agents/claude_code.svg
+```
+
+The filename must match the generated one (`devsignal hosts list` prints the host slugs). Re-run the
+build script and it reports which files came from `overrides/`.
+
+**Check the licence before you add art here.** This folder is published to GitHub and served to
+Discord like everything else, so an override is *redistribution*. Icon packs on Behance, DeviantArt,
+Dribbble, and the like are normally © the artist and frequently licensed for personal use only —
+"free download" is not the same as "free to redistribute". Sets that are safe to vendor state it:
+CC0, MIT, CC-BY (with attribution), or an explicit redistribution grant you have bought. If you are
+not sure, keep it local: point `[images] base_url` at your own private host instead of committing the
+files.
+
 ## Provenance and trademarks
 
-Brand glyphs come from [simple-icons](https://www.npmjs.com/package/simple-icons) v16.27.1, whose
-icon files are released under **CC0 1.0**. The extracted path data lives in `sources.json` so the
-build is reproducible offline.
+Glyph data is vendored in `sources.json`, extracted from four icon sets distributed on npm:
 
-Apps simple-icons does not carry — VS Code, Apple Terminal, Kitty, Tabby, RustRover, Fleet, Nova,
-Codex — get a **monogram tile** rather than a hand-traced look-alike. Two of those logos were removed
-from simple-icons at their owners' request, and re-drawing them here would route around that.
+| Set | Package | Licence | Used for |
+| --- | --- | --- | --- |
+| [SVG Logos](https://github.com/gilbarbara/logos) | `@iconify-json/logos` | CC0-1.0 | 20 marks — VS Code, Xcode, the JetBrains SKUs, Claude, OpenAI, Qwen, Android, Terminal, Hyper |
+| [Devicon](https://github.com/devicons/devicon) | `@iconify-json/devicon` | MIT | Zed, Cursor, VSCodium, Android Studio |
+| [vscode-icons](https://github.com/vscode-icons/vscode-icons) | `@iconify-json/vscode-icons` | MIT | Fleet, Gemini |
+| [Simple Icons](https://github.com/simple-icons/simple-icons) | `@iconify-json/simple-icons` | CC0-1.0 | one-colour marks — Ghostty, Warp, Alacritty, WezTerm, iTerm2, Aqua, Apple, OpenCode, Cline |
+
+Eight apps have no logo in any of them and get a monogram instead of a hand-traced look-alike:
+Kitty, Tabby, Nova, RustRover, Amp, Aider, Crush, Goose. VS Code's and OpenAI's logos were removed
+from Simple Icons at their owners' request, which is why those two come from sets that carry them
+with permission rather than being re-drawn here.
 
 The `devsignal` mark is our own.
 

@@ -165,9 +165,9 @@ override — rename the application in the Developer Portal, or keep the default
 
 ### Images
 
-Every agent and host app ships a 512×512 PNG in [`assets/discord/`](assets/discord/). Discord accepts
-a plain `https://` image URL wherever it accepts an uploaded art-asset key, so nothing has to be
-uploaded:
+Every agent and host app ships a 512×512 PNG in [`assets/discord/`](assets/discord/) — each app's own
+logo on a tile tinted to that logo's colour. Discord accepts a plain `https://` image URL wherever it
+accepts an uploaded art-asset key, so nothing has to be uploaded:
 
 ```toml
 [images]
@@ -183,6 +183,12 @@ absolute `http(s)` URL is passed through in either mode, so one agent can point 
 
 `host_icon` follows the host *label*: anything that hides the label — `platforms.disabled_hosts`, a
 rule's `hide_host` — hides the icon too, so the app cannot leak through its image.
+
+Prefer a different icon pack? Drop `<name>.png` or `<name>.svg` into
+`assets/discord/overrides/{agents,hosts}/` and it replaces the generated tile verbatim — no code
+change. Mind the licence first: the folder is published and served, so an override is redistribution,
+and most packs on design sites are personal-use only. See
+[`assets/discord/README.md`](assets/discord/README.md).
 
 ## Configuration
 
