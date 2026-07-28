@@ -6,10 +6,12 @@
 
   Placeholders substituted at install time:
     /REPLACE/WITH/ABSOLUTE/PATH/TO/devsignal  absolute path to the binary
+    REPLACE_CONFIG_PATH                       absolute path to config.toml
     REPLACE_HOME                              your home directory
 
-  Note: XML comments cannot contain a double hyphen, so command lines with flags
-  are documented in README.md rather than here.
+  The config path is passed explicitly because launchd runs with a minimal environment, so the
+  daemon must not depend on resolving the default path itself. Note that XML comments cannot
+  contain a double hyphen, so flags are described in README.md rather than here.
 -->
 <plist version="1.0">
 <dict>
@@ -19,6 +21,8 @@
   <key>ProgramArguments</key>
   <array>
     <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/devsignal</string>
+    <string>--config</string>
+    <string>REPLACE_CONFIG_PATH</string>
   </array>
 
   <key>RunAtLoad</key>

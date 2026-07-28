@@ -21,23 +21,26 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # Every job used to cold-build the whole dependency graph on every run.
+      - uses: Swatinem/rust-cache@v2
+
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
       # Everything except devsignal-macos, which needs the macOS SDK. The daemon is included
       # because CLI parsing and the run loop are no longer behind `cfg(target_os = "macos")`.
       - name: cargo clippy (linux-safe crates)
-        run: cargo clippy -p devsignal-core -p devsignal-discord -p devsignal-daemon --all-targets -- -D warnings
+        run: cargo clippy -p devsignal-core -p devsignal-discord -p devsignal-daemon --all-targets --locked -- -D warnings
 
       - name: cargo test (linux-safe crates)
-        run: cargo test -p devsignal-core -p devsignal-daemon
+        run: cargo test -p devsignal-core -p devsignal-discord -p devsignal-daemon --locked
 
-      # install.sh is the only install path now that the Homebrew formula is gone, so it is worth
-      # linting. Not available in every dev environment, which is why it runs here.
+      # The install and uninstall scripts are the whole distribution story, so they are worth
+      # linting. shellcheck is not available in every dev environment, which is why it runs here.
       - name: shellcheck
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-          shellcheck packaging/macos/install.sh scripts/*.sh
+          shellcheck packaging/macos/install.sh packaging/macos/uninstall.sh scripts/*.sh
 
   # The declared MSRV was 1.74 for months while the code needed 1.87; both other jobs use `stable`,
   # so nothing caught it. This job makes rust-version a checked claim.
@@ -55,6 +58,10 @@ jobs:
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-${{ steps.msrv.outputs.version }}
+
       # Only devsignal-macos is excluded; it needs the macOS SDK.
       - name: cargo check at MSRV
         run: cargo check -p devsignal-core -p devsignal-discord -p devsignal-daemon --all-targets --locked
@@ -69,11 +76,36 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # The macOS job compiles the workspace three times over (clippy all-targets, test, release), so
+      # it benefits most.
+      - uses: Swatinem/rust-cache@v2
+
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: cargo build
-        run: cargo build --workspace --release
+        run: cargo build --workspace --release --locked
+
+  # 157 packages in Cargo.lock and nothing checking them for advisories. Informational for now:
+  # `continue-on-error` so a fresh advisory against a transitive dependency reports without blocking
+  # an unrelated PR.
+  audit:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: audit
+
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
