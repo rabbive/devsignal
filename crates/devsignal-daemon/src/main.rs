@@ -693,10 +693,17 @@ fn push(state: &mut RunState, action: PresenceAction<'_>, force: bool) {
         return;
     }
 
-    if !state.debouncer.may_send(action, force) {
+    // While a push is unacknowledged, the debouncer's dedupe key describes the last payload Discord
+    // *confirmed* — not what it is showing now, which we no longer know. Trusting it here reopens the
+    // wedge through a narrower door: send A, fail on B, then have the view return to A, and the retry
+    // is deduplicated against a payload Discord may never have received.
+    let recovering = state.backoff.consecutive_failures() > 0;
+
+    if !state.debouncer.may_send(action, force || recovering) {
+        // Keep this tied to a real transition. A refused *forced* send can only be the rate limit —
+        // force already skips the equality check and the minimum interval — but a refused retry is
+        // routine and must not warn on every backoff-ready tick during an outage.
         if force {
-            // A refused *forced* send can only be the rate limit: force already skips the equality
-            // check and the minimum interval.
             warn!("presence update suppressed by the Discord rate limit; is an agent process flapping?");
         }
         return;
@@ -929,6 +936,77 @@ mod tests {
             log.borrow().sets,
             1,
             "an unchanged view must be deduplicated after a confirmed send"
+        );
+    }
+
+    /// The shape none of the other retry tests cover: a **success followed by a failure**.
+    ///
+    /// Those tests all start with an always-failing sink, so `last_sent` stays `None` and the dedupe
+    /// equality check is never true. Once a send has landed, `last_sent` holds it — and since a failed
+    /// send records nothing, a later tick whose view equals that last *successful* payload gets
+    /// deduplicated against a payload Discord may never have received, freezing the retry loop.
+    ///
+    /// The view is varied by editing `brand_text`, which the `brand` line slot renders.
+    ///
+    /// Reverting the `recovering` bypass in `push` makes this fail with 2 sink calls instead of 3.
+    #[test]
+    fn a_failed_push_is_retried_even_when_the_view_matches_the_last_success() {
+        // Succeed once, then fail forever.
+        let (sink, log) = sink::ScriptedSink::new(&[true, false]);
+        let cfg = test_config("[presence]\nstate = \"brand\"\nbrand_text = \"A\"\n");
+        let mut state = test_run_state(
+            cfg,
+            Box::new(sink),
+            RetryBackoff::new(Duration::ZERO, Duration::ZERO),
+        );
+
+        // Tick 1 is forced (first tick) and succeeds, so view A becomes the dedupe key.
+        tick(&mut state);
+        assert_eq!(log.borrow().sets, 1, "the first send lands");
+
+        // The view changes to B and the send fails, so `last_sent` still holds A.
+        state.cfg.presence.brand_text = "B".into();
+        tick(&mut state);
+        assert_eq!(
+            log.borrow().sets,
+            2,
+            "the changed view is attempted and fails"
+        );
+
+        // Now the view returns to exactly A — the payload Discord last confirmed, but which it may have
+        // lost in the meantime. This must still be retried.
+        state.cfg.presence.brand_text = "A".into();
+        tick(&mut state);
+        assert_eq!(
+            log.borrow().sets,
+            3,
+            "a payload equal to the last success must still be retried while a failure is outstanding"
+        );
+    }
+
+    /// Case (b): nothing changes at all. Deduplication assumes Discord still shows the last payload, and
+    /// a Discord that quit and reopened has no way to say otherwise — so an unchanged view must be
+    /// re-asserted, or the daemon never even attempts a send to discover Discord was gone.
+    #[test]
+    fn an_unchanged_view_is_reasserted_so_a_restarted_discord_recovers() {
+        let (sink, log) = sink::ScriptedSink::new(&[true]);
+        let mut state = test_run_state(test_config(""), Box::new(sink), RetryBackoff::default());
+        state.debouncer = Debouncer::with_limits(Duration::ZERO, 100, Duration::from_secs(60))
+            .with_reassert_after(Duration::from_millis(120));
+
+        tick(&mut state);
+        assert_eq!(log.borrow().sets, 1);
+
+        // Inside the interval the payload stays deduplicated.
+        tick(&mut state);
+        assert_eq!(log.borrow().sets, 1, "still deduplicated");
+
+        std::thread::sleep(Duration::from_millis(150));
+        tick(&mut state);
+        assert_eq!(
+            log.borrow().sets,
+            2,
+            "past the re-assert interval an unchanged view goes out again"
         );
     }
 

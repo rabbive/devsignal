@@ -135,8 +135,10 @@ Rust workspace, 4 crates under `crates/`:
    1. `RetryBackoff::ready` — skip entirely while waiting out a previous failure.
    2. `Debouncer::may_send(action, force)` — suppresses an unchanged payload or one inside
       `min_push_interval_secs`, and enforces a sliding window of 5 sends per 20s (Discord's documented
-      limit) **even when `force` is set**. `force` is set on agent transitions, the first tick, and
-      after a config reload. `may_send` does **not** record.
+      limit) **even when `force` is set**. `force` is set on agent transitions, the first tick, after a
+      config reload, and — critically — whenever `backoff.consecutive_failures() > 0`, because an
+      unacknowledged push means the dedupe key no longer describes what Discord is showing. `may_send`
+      does **not** record.
    3. The `PresenceSink`, which now returns `Result`: Discord IPC under `run`, stdout under `watch`.
    4. On `Ok`, `Debouncer::record_sent` **and** `RetryBackoff::record_success`; on `Err`,
       `RetryBackoff::record_failure` and nothing recorded in the debouncer.
@@ -211,6 +213,15 @@ to stdout. Platform gating is a runtime check in `require_macos`, applied only t
   why `matched_rule_name` is **not** a field on it: a rule-name change alone would trigger a Discord
   write with identical visible text. It also owns the 5-per-20s rate limit, which applies to forced
   sends too — `force` keeps transitions responsive, it does not license unbounded IPC traffic.
+- Deduplication **expires** after `REASSERT_INTERVAL` (60s), so an unchanged payload is re-sent rather
+  than suppressed forever. Dedupe assumes Discord still shows the last confirmed payload, and nothing
+  signals when that stops being true — a Discord that quit and reopened has no activity and no way to say
+  so. Without the expiry a user with a static view (one terminal, unchanged host label) never got
+  presence back, and the daemon never even attempted a send to *discover* Discord was gone. A re-assert
+  still respects `min_push_interval_secs`, so the effective period is `max(60s, min_interval)`.
+- The dedupe key is also bypassed while a failure is outstanding (see main-loop step 9.2). Trusting it
+  during an outage reopens the wedge through a narrower door: send A, fail on B, let the view return to
+  A, and the retry is deduplicated against a payload Discord may never have received.
 - The debouncer is **two-phase**: `may_send` asks, `record_sent` confirms, and only the daemon's success
   branch calls the second. Recording at check time is a silent-wedge generator — the payload is marked
   delivered whether or not it arrived. A failed send therefore records *nothing*, not even a rate-limit

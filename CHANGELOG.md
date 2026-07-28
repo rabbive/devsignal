@@ -20,6 +20,17 @@ silently no longer doing its job.
   `may_send` (which does not record) plus `record_sent`, called only once the sink confirms delivery.
   A failed send records nothing — not even a rate-limit slot, since it consumed none of Discord's
   budget — which is what lets the next tick retry.
+- **Deduplication now expires after 60 seconds**, so an unchanged payload is re-asserted instead of
+  suppressed forever. Dedupe assumed Discord still showed the last confirmed payload, and a Discord that
+  quit and reopened has no activity and no way to say otherwise — so a user with a static view (sitting
+  in one terminal, host label unchanged) got no presence back at all, and the daemon never even attempted
+  a send to discover Discord had gone. This bounds recovery from *any* divergence — restart, sleep, a
+  dropped socket — to a minute, at one write per minute against Discord's 15/minute budget. A re-assert
+  still respects `min_push_interval_secs`.
+- **A retry is no longer deduplicated against the last successful payload.** A failed send records
+  nothing, so `last_sent` keeps the last *delivered* payload; if the view changed, failed, and then
+  changed back, the retry matched that key and was suppressed, freezing the retry loop with the failure
+  state never cleared. The dedupe check is now bypassed while a failure is outstanding.
 - **A new `RetryBackoff` bounds that retry** (400ms doubling to 60s), so a closed Discord is not
   reopened every `poll_interval_secs`. It gates every failure, not just an absent client: a payload
   Discord actively rejects is indistinguishable at that layer.

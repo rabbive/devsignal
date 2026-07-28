@@ -764,11 +764,28 @@ enum LastSent {
     Clear,
 }
 
+/// How long an unchanged payload stays deduplicated before it is re-sent anyway.
+///
+/// Deduplication assumes Discord still shows what we last successfully sent, and nothing tells us when
+/// that stops being true: a Discord that quit and reopened has no activity at all, and the IPC socket
+/// offers no liveness signal. Without an expiry, an unchanged payload is never sent again — so a user
+/// sitting in one terminal (a completely static view) would never get presence back after restarting
+/// Discord, and the daemon would never even attempt a send to discover it was gone.
+///
+/// One write a minute against Discord's documented 15/minute budget, in exchange for bounding *any*
+/// divergence — restart, sleep, a dropped socket — to a minute.
+///
+/// A re-assert is still subject to `min_push_interval_secs`, so the effective period is
+/// `max(REASSERT_INTERVAL, min_interval)`. That is deliberate: someone who asked for at most one push
+/// per five minutes should not get one per minute because nothing changed.
+pub const REASSERT_INTERVAL: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone)]
 pub struct Debouncer {
     min_interval: Duration,
     max_sends: usize,
     window: Duration,
+    reassert_after: Duration,
     last_sent: Option<LastSent>,
     last_push: Option<Instant>,
     /// Timestamps of sends inside the current window, oldest first.
@@ -787,10 +804,17 @@ impl Debouncer {
             min_interval,
             max_sends,
             window,
+            reassert_after: REASSERT_INTERVAL,
             last_sent: None,
             last_push: None,
             recent: std::collections::VecDeque::new(),
         }
+    }
+
+    /// Override the re-assert interval, so tests can exercise the expiry without sleeping a minute.
+    pub fn with_reassert_after(mut self, reassert_after: Duration) -> Self {
+        self.reassert_after = reassert_after;
+        self
     }
 
     /// Adjust the minimum interval in place. Used by config hot-reload: rebuilding the debouncer
@@ -849,7 +873,7 @@ impl Debouncer {
         if force {
             return true;
         }
-        if self.matches_last(action) {
+        if self.matches_last(action) && !self.reassert_due(now) {
             return false;
         }
         if let Some(t) = self.last_push {
@@ -858,6 +882,17 @@ impl Debouncer {
             }
         }
         true
+    }
+
+    /// Whether an unchanged payload is old enough to be re-sent anyway. See [`REASSERT_INTERVAL`].
+    ///
+    /// With no recorded send there is nothing to re-assert — `matches_last` is false in that case
+    /// anyway, so this only matters for the belt-and-braces reading.
+    fn reassert_due(&self, now: Instant) -> bool {
+        match self.last_push {
+            Some(t) => now.duration_since(t) >= self.reassert_after,
+            None => false,
+        }
     }
 
     /// Record a send the sink confirmed: advances the dedupe key, the minimum-interval clock, and the
@@ -2425,6 +2460,54 @@ mod tests {
             !d.may_send(PresenceAction::Set(&v), false),
             "once confirmed, the identical payload is deduplicated"
         );
+    }
+
+    /// Deduplication assumes Discord still shows what we last sent, and nothing tells us when that
+    /// stops being true — a Discord that quit and reopened has no activity and no way to say so. So an
+    /// unchanged payload has to be re-sent eventually, or a user with a completely static view (one
+    /// terminal, host label unchanged) never gets presence back, and the daemon never even attempts a
+    /// send to discover Discord was gone.
+    #[test]
+    fn an_unchanged_payload_is_resent_after_the_reassert_interval() {
+        let mut d = Debouncer::with_limits(Duration::ZERO, 100, Duration::from_secs(60))
+            .with_reassert_after(Duration::from_millis(120));
+        let v = view_named("a");
+
+        assert!(push(&mut d, &v, true), "first send goes out");
+        assert!(
+            !push(&mut d, &v, false),
+            "an unchanged payload is deduplicated straight away"
+        );
+
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            push(&mut d, &v, false),
+            "once the re-assert interval passes, the same payload goes out again"
+        );
+    }
+
+    /// The expiry must not degenerate into "no deduplication at all" — that was the pre-0.3.0 behaviour
+    /// of writing to Discord every tick.
+    #[test]
+    fn an_unchanged_payload_is_still_deduped_inside_the_interval() {
+        let mut d = Debouncer::with_limits(Duration::ZERO, 100, Duration::from_secs(60))
+            .with_reassert_after(Duration::from_secs(60));
+        let v = view_named("a");
+
+        assert!(push(&mut d, &v, true));
+        for i in 0..20 {
+            assert!(
+                !push(&mut d, &v, false),
+                "tick {i} is well inside the interval and must be suppressed"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_reassert_interval_is_a_minute() {
+        assert_eq!(REASSERT_INTERVAL, Duration::from_secs(60));
+        // Longer than the rate-limit window, so a re-assert can never be what exhausts the budget.
+        assert!(REASSERT_INTERVAL > RATE_LIMIT_WINDOW);
     }
 
     /// A send that never reached Discord consumed none of Discord's budget, so it must not eat a slot.
