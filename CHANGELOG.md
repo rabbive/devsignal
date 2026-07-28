@@ -3,9 +3,74 @@
 All notable changes to devsignal. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver.
 
-## [Unreleased]
+## [0.4.0] - 2026-07-28
+
+The presence-layout and art work had been sitting on `main` unreleased since 0.3.0. Shipping it turned
+up one more instance of the failure mode 0.3.0 was mostly about: the daemon staying alive while
+silently no longer doing its job.
+
+### Fixed
+
+- **Quitting and reopening Discord no longer kills presence permanently.** The debouncer recorded a
+  payload as sent *before* the sink was called, and the sink returned `()`, so a failed push was
+  indistinguishable from a delivered one. The next tick deduplicated against a payload Discord never
+  received, the sink was never called again, and the reconnect inside `set_presence_resilient`
+  therefore never fired — presence stayed dead until the active agent happened to change.
+  `idle_mode = "clear"` had the same bug by the same mechanism. `Debouncer::should_send` is now
+  `may_send` (which does not record) plus `record_sent`, called only once the sink confirms delivery.
+  A failed send records nothing — not even a rate-limit slot, since it consumed none of Discord's
+  budget — which is what lets the next tick retry.
+- **A new `RetryBackoff` bounds that retry** (400ms doubling to 60s), so a closed Discord is not
+  reopened every `poll_interval_secs`. It gates every failure, not just an absent client: a payload
+  Discord actively rejects is indistinguishable at that layer.
+- **A startup connect timeout is no longer fatal** under `--wait-for-discord` (the default). launchd
+  starts devsignal before Discord finishes launching at login, so the old exit 1 meant `KeepAlive`
+  respawning the daemon every 10 seconds indefinitely — the *normal* login sequence, not an edge case.
+  `--no-wait-for-discord` keeps its fail-fast contract for scripts.
+- **The LaunchAgent throttles respawns** (`ThrottleInterval` 60, against launchd's 10s default), and
+  `install.sh` now runs `devsignal validate` before `launchctl bootstrap` so a config that cannot load
+  is never installed as a job in the first place. Exit codes cannot tell launchd that a failure is
+  permanent — a Rust panic exits 101 like anything else — so both ends are needed.
+- **`install.sh` no longer requires `python3`.** The LaunchAgent template carries `--config` with a
+  placeholder, so `sed` alone finishes the job. The old `plistlib` pass ran *after* `sed` had written
+  the file, so on a machine without `python3` it failed leaving a plist with no `--config` at all.
+- **`curl | bash` upgrades restart the running LaunchAgent.** With no TTY the script exited before the
+  `launchctl` block, installing the new binary while the old one kept running until next login, with
+  nothing saying so.
+- Download failures get a retry and a message naming the release page instead of a bare `curl` error.
 
 ### Added
+
+- **`devsignal run` refuses to start when another instance is running.** Two daemons both push to the
+  same Discord client and fight over the card, and each one's debouncer believes its own view is what
+  Discord is showing. An advisory `flock` beside the config detects it; the error names the lock path,
+  the holder's pid, and how to stop it. Scoped to the config's directory, so running a second daemon
+  against a different config stays possible on purpose. `watch` does not take the lock.
+- **`packaging/macos/uninstall.sh`** — there was no uninstall path anywhere: no script, no subcommand,
+  no docs. It unloads the LaunchAgent first, so the daemon clears Discord presence on its way out, then
+  removes the plist, binary and logs. Your config is kept unless you pass `--purge`.
+- **A Troubleshooting section in the README**, covering presence not showing, Discord not detected,
+  blank image tiles, an undetected agent CLI, the Automation permission prompt, and where the logs are.
+- `devsignal-discord` has tests for the first time, via a `PresenceIpc` trait seam — the crate was
+  untestable because `PresenceSession` wraps a concrete `DiscordIpcClient` with no fake.
+
+### Changed
+
+- `PresenceSink::set`/`clear` and both `*_resilient` helpers return `Result`. The helpers report
+  failures rather than logging and swallowing them, so the caller can act on them.
+- Presence failures log on **transition only** — `warn!` on the first, `debug!` after, `info!` on
+  recovery — and the LaunchAgent's baked-in `RUST_LOG` drops from `info` to `warn`. launchd appends to
+  its log files forever with no rotation, so a day with Discord closed would otherwise fill them.
+- `run_forever`'s body is extracted into `tick()`, and the duplicated `Set`/`Clear` debouncer blocks
+  collapse into one `push()`, so both paths share the gate and the failure paths are unit-testable
+  without subprocesses or signals.
+- CI caches builds (`Swatinem/rust-cache`), passes `--locked` in every job rather than only `msrv`,
+  tests `devsignal-discord`, shellchecks `uninstall.sh`, and runs an informational `cargo audit` —
+  157 packages had nothing checking them for advisories.
+- The README no longer contradicts itself about code signing. Published releases are **unsigned**; the
+  release workflow implements signing and notarization but is gated on five secrets that are not set.
+
+### Added — the presence layout and art work, unreleased since 0.3.0
 
 - **`[presence]`: choose what each line of the Discord card shows.** Discord draws three lines and the
   first is the *application's* name, which is why presence read `devsignal / Claude Code / In Ghostty`
@@ -34,7 +99,7 @@ All notable changes to devsignal. Format loosely follows
 - `devsignal init` asks for the line order and the image source, and prints the right asset list for
   the mode chosen.
 
-### Changed
+### Changed — by that same presence work
 
 - `HOST_BUNDLE_LABELS` is now `HOST_APPS`, a struct table carrying each host's icon name alongside its
   label. Two tests assert every icon name in the code has a PNG on disk, in both directions.
