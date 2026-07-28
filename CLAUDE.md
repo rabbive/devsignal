@@ -59,9 +59,10 @@ cargo run -p devsignal-daemon -- init
 CI (`.github/workflows/ci.yml`) has four jobs: `lint` (Linux) runs `cargo fmt --check`, clippy, tests,
 and `shellcheck` for every crate except `devsignal-macos`; `msrv` builds against exactly the declared
 `rust-version` so that claim stays checked; `macos` runs workspace clippy, `cargo test`, and a release
-build; `audit` runs `cargo audit` (informational — `continue-on-error`, so a new advisory against a
-transitive dependency reports without blocking an unrelated PR). All jobs use `Swatinem/rust-cache` and
-pass `--locked`, so lockfile drift fails everywhere rather than only in `msrv`.
+build; `audit` runs `cargo audit` with `continue-on-error`, so a new advisory against a transitive
+dependency does **not** block merge — but it still reports a red check, which is the point: advisories
+appear on their own schedule and can turn this red on a PR that changed nothing. All jobs use
+`Swatinem/rust-cache` and pass `--locked`, so lockfile drift fails everywhere rather than only in `msrv`.
 MSRV is Rust **1.87** (`workspace.package.rust-version`) — determined empirically; the floor comes
 from the dependency graph as much as from our code. `Cargo.lock` is committed.
 
@@ -77,7 +78,7 @@ Rust workspace, 4 crates under `crates/`:
 |---|---|
 | `devsignal-core` | Config/TOML, agent matching, host labels + icons, presence rules, line layout, image resolution, `PresenceView`, `Debouncer`, `RetryBackoff` — no OS or Discord deps |
 | `devsignal-macos` | `frontmost_bundle_id()` via AppKit `NSWorkspace` (`objc2`); falls back to `osascript` after two consecutive native misses |
-| `devsignal-discord` | `PresenceSession` wrapping `discord-rich-presence`; `set_presence_resilient` / `clear_presence_resilient` (one reconnect on failure, **returning `Result`**) behind a `PresenceIpc` trait so the retry policy is testable without a Discord client |
+| `devsignal-discord` | `PresenceSession` wrapping `discord-rich-presence`; `set_presence_resilient` / `clear_presence_resilient` (**returning `Result`**) recover via `reestablish` — one `reconnect()`, then a plain `connect()`, because `reconnect()` cannot revive a client that never connected — all behind a `PresenceIpc` trait so the policy is testable without a Discord client |
 | `devsignal-daemon` | Binary `devsignal`: hand-rolled CLI parsing, `init` wizard, config-edit subcommands, poll loop |
 
 `devsignal-daemon` modules:
@@ -355,9 +356,11 @@ raw bundle id would be a 404 in url mode).
 - These remain **unverified** because each needs a Mac with a real Discord client, and none should be
   assumed done:
   1. **Discord restart recovery** (0.4.0's headline fix). Quit Discord while the daemon runs, wait past
-     `min_push_interval_secs`, reopen it → presence must come back on its own. This is also the check
-     on whether `DiscordIpcClient::reconnect()` can recover a socket that died while the process slept;
-     if it cannot, the fallback is calling `connect()` when `consecutive_failures == 0`.
+     `min_push_interval_secs`, reopen it → presence must come back on its own. No longer depends on
+     `DiscordIpcClient::reconnect()` behaving: `reestablish` in `devsignal-discord` falls back to a
+     plain `connect()` when `reconnect()` fails. That fallback is **required**, not belt-and-braces —
+     `reconnect()` starts with `close()`, which returns `Err(NotConnected)` when there is no socket, so
+     it can never recover a client that never connected.
   2. **Login with Discord not running** → the daemon stays up and connects once Discord appears, with
      no respawn loop in the log.
   3. `launchctl bootout gui/$(id -u)/com.devsignal.daemon` → presence clears in the actual client. The

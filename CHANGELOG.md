@@ -23,6 +23,11 @@ silently no longer doing its job.
 - **A new `RetryBackoff` bounds that retry** (400ms doubling to 60s), so a closed Discord is not
   reopened every `poll_interval_secs`. It gates every failure, not just an absent client: a payload
   Discord actively rejects is indistinguishable at that layer.
+- **A never-connected session can now recover.** `DiscordIpcClient::reconnect` begins with `close()`,
+  which returns `Err(NotConnected)` when there is no socket, so it never reaches `connect_ipc` and cannot
+  recover a client that never connected — exactly the state left by the non-fatal startup timeout below.
+  The resilient helpers now fall back to a plain `connect()` when `reconnect()` fails. Without it the
+  daemon would stay alive holding the instance lock and never publish anything.
 - **A startup connect timeout is no longer fatal** under `--wait-for-discord` (the default). launchd
   starts devsignal before Discord finishes launching at login, so the old exit 1 meant `KeepAlive`
   respawning the daemon every 10 seconds indefinitely — the *normal* login sequence, not an edge case.
@@ -65,8 +70,9 @@ silently no longer doing its job.
   collapse into one `push()`, so both paths share the gate and the failure paths are unit-testable
   without subprocesses or signals.
 - CI caches builds (`Swatinem/rust-cache`), passes `--locked` in every job rather than only `msrv`,
-  tests `devsignal-discord`, shellchecks `uninstall.sh`, and runs an informational `cargo audit` —
-  157 packages had nothing checking them for advisories.
+  tests `devsignal-discord`, shellchecks `uninstall.sh`, and runs `cargo audit` — 157 packages had
+  nothing checking them for advisories. The audit job does not block merge (`continue-on-error`), but it
+  does report a red check on a finding, since advisories can appear on a PR that changed nothing.
 - The README no longer contradicts itself about code signing. Published releases are **unsigned**; the
   release workflow implements signing and notarization but is gated on five secrets that are not set.
 
