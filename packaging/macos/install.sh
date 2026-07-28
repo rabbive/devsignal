@@ -149,6 +149,16 @@ with open(path, "wb") as fh:
     plistlib.dump(plist, fh)
 PY
 
+# Never bootstrap a job that cannot start. `KeepAlive` restarts the daemon on any nonzero exit, and
+# an unloadable config is a permanent failure, so installing one means a respawn every minute until
+# the user notices. Exit codes cannot tell launchd the difference, so check here instead.
+if ! "${HOME}/bin/devsignal" validate --config "$CFG_FILE" >/dev/null 2>&1; then
+  echo "Not loading the LaunchAgent: ${CFG_FILE} does not validate." >&2
+  echo "Fix it (or run 'devsignal init'), then re-run this script. The error was:" >&2
+  "${HOME}/bin/devsignal" validate --config "$CFG_FILE" >&2 || true
+  exit 1
+fi
+
 launchctl bootout "gui/$(id -u)/com.devsignal.daemon" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST_DST"
 launchctl kickstart -k "gui/$(id -u)/com.devsignal.daemon"
