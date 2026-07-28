@@ -820,34 +820,36 @@ impl Debouncer {
         self.recent.len() >= self.max_sends
     }
 
-    fn record(&mut self, sent: LastSent, now: Instant) {
-        self.last_sent = Some(sent);
-        self.last_push = Some(now);
-        self.recent.push_back(now);
+    /// Whether `action` is what we last told Discord. Compares in place rather than building a
+    /// `LastSent`, because this now runs every tick whether or not anything is sent.
+    fn matches_last(&self, action: PresenceAction<'_>) -> bool {
+        match (self.last_sent.as_ref(), action) {
+            (Some(LastSent::Set(prev)), PresenceAction::Set(view)) => prev.as_ref() == view,
+            (Some(LastSent::Clear), PresenceAction::Clear) => true,
+            _ => false,
+        }
     }
 
-    /// Whether to send `action` to Discord now.
+    /// Whether `action` may be sent to Discord now.
     ///
-    /// `force` (an agent transition, or the first tick) skips the equality check and the
-    /// `min_push_interval_secs` wait, but **not** the rate limit. Without that last part, an agent
+    /// Does **not** record it — call [`Debouncer::record_sent`] once the sink confirms the send
+    /// landed. Recording an unconfirmed send is what used to wedge the daemon: a failed push was
+    /// marked as delivered, the next tick deduped against it, and the sink was never called again, so
+    /// the reconnect inside it never fired. Quitting Discord killed presence until the agent changed.
+    ///
+    /// `force` (an agent transition, the first tick, or a config reload) skips the equality check and
+    /// the `min_push_interval_secs` wait, but **not** the rate limit. Without that last part, an agent
     /// process that flaps in and out on alternate polls makes every tick a transition, and the daemon
     /// writes to Discord every `poll_interval_secs` indefinitely.
-    pub fn should_send(&mut self, action: PresenceAction<'_>, force: bool) -> bool {
+    pub fn may_send(&mut self, action: PresenceAction<'_>, force: bool) -> bool {
         let now = Instant::now();
         if self.rate_limited(now) {
             return false;
         }
-
-        let next = match action {
-            PresenceAction::Set(view) => LastSent::Set(Box::new(view.clone())),
-            PresenceAction::Clear => LastSent::Clear,
-        };
-
         if force {
-            self.record(next, now);
             return true;
         }
-        if self.last_sent.as_ref() == Some(&next) {
+        if self.matches_last(action) {
             return false;
         }
         if let Some(t) = self.last_push {
@@ -855,13 +857,105 @@ impl Debouncer {
                 return false;
             }
         }
-        self.record(next, now);
         true
     }
 
-    /// Convenience wrapper for the common case.
-    pub fn should_push(&mut self, next: &PresenceView, force: bool) -> bool {
-        self.should_send(PresenceAction::Set(next), force)
+    /// Record a send the sink confirmed: advances the dedupe key, the minimum-interval clock, and the
+    /// 5-per-20s window.
+    ///
+    /// A *failed* send deliberately records nothing. It never reached Discord, so it consumed none of
+    /// Discord's budget, and leaving the dedupe key untouched is exactly what lets the next tick retry
+    /// the same payload. The retry rate is bounded by [`RetryBackoff`] instead.
+    pub fn record_sent(&mut self, action: PresenceAction<'_>) {
+        let sent = match action {
+            PresenceAction::Set(view) => LastSent::Set(Box::new(view.clone())),
+            PresenceAction::Clear => LastSent::Clear,
+        };
+        let now = Instant::now();
+        self.last_sent = Some(sent);
+        self.last_push = Some(now);
+        self.recent.push_back(now);
+    }
+}
+
+/// Default retry pacing for a failing presence sink.
+///
+/// The base matches the start of `connect_with_wait`'s backoff, so the first retry is effectively the
+/// next poll. The cap is much higher than that function's, because this one bounds a daemon's whole
+/// lifetime rather than a 30-second startup wait: with Discord closed all day, one attempt a minute is
+/// plenty to notice it reopening.
+pub const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(400);
+pub const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// Paces retries after a presence send fails.
+///
+/// Necessary because a failed send records nothing (see [`Debouncer::record_sent`]), so the payload
+/// passes [`Debouncer::may_send`] again on the very next tick. That is right for a Discord that just
+/// restarted and wrong for one that is closed — without a gate the daemon would reopen a dead socket
+/// every `poll_interval_secs` forever.
+///
+/// It gates *every* failure, not just "Discord is not running": a payload Discord actively rejects is
+/// indistinguishable at this layer, and would otherwise be retried every couple of seconds while
+/// consuming no rate-limit slot.
+///
+/// Deliberately the same doubling-with-cap shape as `FallbackGate` in `devsignal-macos`. It cannot
+/// reuse that type, which lives in a macOS-only crate; this one has to run on Linux CI. `base` and
+/// `max` are constructor-injected so tests can pass `Duration::ZERO` instead of sleeping.
+#[derive(Debug, Clone)]
+pub struct RetryBackoff {
+    base: Duration,
+    max: Duration,
+    consecutive_failures: u32,
+    next_attempt: Option<Instant>,
+}
+
+impl Default for RetryBackoff {
+    fn default() -> Self {
+        Self::new(RETRY_BACKOFF_BASE, RETRY_BACKOFF_MAX)
+    }
+}
+
+impl RetryBackoff {
+    pub const fn new(base: Duration, max: Duration) -> Self {
+        Self {
+            base,
+            max,
+            consecutive_failures: 0,
+            next_attempt: None,
+        }
+    }
+
+    /// Whether a send may be attempted now.
+    pub fn ready(&self, now: Instant) -> bool {
+        match self.next_attempt {
+            Some(t) => now >= t,
+            None => true,
+        }
+    }
+
+    pub fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.next_attempt = None;
+    }
+
+    pub fn record_failure(&mut self, now: Instant) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        // Double per failure: 400ms, 800ms, 1.6s, … then capped.
+        let shift = self.consecutive_failures.saturating_sub(1).min(16);
+        let backoff = self.base.saturating_mul(1u32 << shift).min(self.max);
+        self.next_attempt = Some(now + backoff);
+    }
+
+    pub fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+
+    /// How long until the next attempt is allowed, for the one log line that reports a failure.
+    pub fn retry_delay(&self, now: Instant) -> Duration {
+        match self.next_attempt {
+            Some(t) => t.saturating_duration_since(now),
+            None => Duration::ZERO,
+        }
     }
 }
 
@@ -2183,8 +2277,8 @@ mod tests {
     fn debouncer_equal_payload_suppressed() {
         let mut d = Debouncer::new(Duration::from_millis(100));
         let v = view_named("A");
-        assert!(d.should_push(&v, true));
-        assert!(!d.should_push(&v, false));
+        assert!(push(&mut d, &v, true));
+        assert!(!push(&mut d, &v, false));
     }
 
     #[test]
@@ -2192,10 +2286,27 @@ mod tests {
         let mut d = Debouncer::new(Duration::from_millis(400));
         let a = view_named("A");
         let b = view_named("B");
-        assert!(d.should_push(&a, true));
-        assert!(!d.should_push(&b, false));
+        assert!(push(&mut d, &a, true));
+        assert!(!push(&mut d, &b, false));
         std::thread::sleep(Duration::from_millis(450));
-        assert!(d.should_push(&b, false));
+        assert!(push(&mut d, &b, false));
+    }
+
+    /// Check-then-record in one call, i.e. what a sink that always succeeds looks like.
+    ///
+    /// Most debouncer tests care about the sequence of accepted sends rather than the two-phase
+    /// split, and read better through this. The tests that exist *because* the split matters call
+    /// `may_send` / `record_sent` directly.
+    fn send(d: &mut Debouncer, action: PresenceAction<'_>, force: bool) -> bool {
+        let ok = d.may_send(action, force);
+        if ok {
+            d.record_sent(action);
+        }
+        ok
+    }
+
+    fn push(d: &mut Debouncer, view: &PresenceView, force: bool) -> bool {
+        send(d, PresenceAction::Set(view), force)
     }
 
     fn view_named(details: &str) -> PresenceView {
@@ -2221,27 +2332,27 @@ mod tests {
 
         for i in 0..3 {
             assert!(
-                d.should_push(&view_named(&format!("v{i}")), true),
+                push(&mut d, &view_named(&format!("v{i}")), true),
                 "send {i} should be allowed"
             );
         }
         // Cap reached: further forced sends are refused despite `force`.
-        assert!(!d.should_push(&view_named("v3"), true));
-        assert!(!d.should_push(&view_named("v4"), true));
+        assert!(!push(&mut d, &view_named("v3"), true));
+        assert!(!push(&mut d, &view_named("v4"), true));
         // And a non-forced one too.
-        assert!(!d.should_push(&view_named("v5"), false));
+        assert!(!push(&mut d, &view_named("v5"), false));
     }
 
     #[test]
     fn rate_limit_window_slides() {
         let mut d = Debouncer::with_limits(Duration::from_millis(1), 2, Duration::from_millis(300));
-        assert!(d.should_push(&view_named("a"), true));
-        assert!(d.should_push(&view_named("b"), true));
-        assert!(!d.should_push(&view_named("c"), true), "cap of 2 reached");
+        assert!(push(&mut d, &view_named("a"), true));
+        assert!(push(&mut d, &view_named("b"), true));
+        assert!(!push(&mut d, &view_named("c"), true), "cap of 2 reached");
 
         // Once the window rolls past the earlier sends, capacity returns.
         std::thread::sleep(Duration::from_millis(350));
-        assert!(d.should_push(&view_named("c"), true));
+        assert!(push(&mut d, &view_named("c"), true));
     }
 
     /// `idle_mode = "clear"` used to bypass the debouncer entirely — it was not merely exempt from
@@ -2249,10 +2360,10 @@ mod tests {
     #[test]
     fn clears_go_through_the_same_limiter_as_sets() {
         let mut d = Debouncer::with_limits(Duration::from_millis(1), 2, Duration::from_secs(60));
-        assert!(d.should_send(PresenceAction::Clear, true));
-        assert!(d.should_send(PresenceAction::Clear, true));
+        assert!(send(&mut d, PresenceAction::Clear, true));
+        assert!(send(&mut d, PresenceAction::Clear, true));
         assert!(
-            !d.should_send(PresenceAction::Clear, true),
+            !send(&mut d, PresenceAction::Clear, true),
             "clears must consume rate-limit budget too"
         );
     }
@@ -2260,9 +2371,9 @@ mod tests {
     #[test]
     fn a_repeated_clear_is_deduplicated() {
         let mut d = Debouncer::with_limits(Duration::from_millis(1), 10, Duration::from_secs(60));
-        assert!(d.should_send(PresenceAction::Clear, false));
+        assert!(send(&mut d, PresenceAction::Clear, false));
         assert!(
-            !d.should_send(PresenceAction::Clear, false),
+            !send(&mut d, PresenceAction::Clear, false),
             "an unchanged clear should not be resent"
         );
     }
@@ -2272,26 +2383,123 @@ mod tests {
     fn alternating_set_and_clear_are_distinct_payloads() {
         let mut d = Debouncer::with_limits(Duration::ZERO, 10, Duration::from_secs(60));
         let v = view_named("a");
-        assert!(d.should_send(PresenceAction::Set(&v), false));
-        assert!(d.should_send(PresenceAction::Clear, false));
-        assert!(d.should_send(PresenceAction::Set(&v), false));
+        assert!(send(&mut d, PresenceAction::Set(&v), false));
+        assert!(send(&mut d, PresenceAction::Clear, false));
+        assert!(send(&mut d, PresenceAction::Set(&v), false));
     }
 
     #[test]
     fn set_min_interval_preserves_dedupe_and_window_state() {
         let mut d = Debouncer::with_limits(Duration::from_secs(60), 5, Duration::from_secs(60));
         let v = view_named("a");
-        assert!(d.should_push(&v, true));
+        assert!(push(&mut d, &v, true));
         assert_eq!(d.min_interval(), Duration::from_secs(60));
 
         // Hot-reload lowering the interval must not forget what was already sent.
         d.set_min_interval(Duration::ZERO);
         assert_eq!(d.min_interval(), Duration::ZERO);
         assert!(
-            !d.should_push(&v, false),
+            !push(&mut d, &v, false),
             "the identical payload should still be deduplicated after a reload"
         );
-        assert!(d.should_push(&view_named("b"), false));
+        assert!(push(&mut d, &view_named("b"), false));
+    }
+
+    /// The core of the wedge fix: checking permission must not mark the payload as delivered. If it
+    /// does, a failed send is indistinguishable from a successful one and the retry never happens.
+    ///
+    /// Reverting `may_send` to the old record-on-check behaviour fails this test.
+    #[test]
+    fn may_send_does_not_record_until_record_sent() {
+        let mut d = Debouncer::with_limits(Duration::ZERO, 10, Duration::from_secs(60));
+        let v = view_named("a");
+
+        assert!(d.may_send(PresenceAction::Set(&v), false));
+        assert!(
+            d.may_send(PresenceAction::Set(&v), false),
+            "an unconfirmed payload must still be sendable — this is the retry path"
+        );
+
+        d.record_sent(PresenceAction::Set(&v));
+        assert!(
+            !d.may_send(PresenceAction::Set(&v), false),
+            "once confirmed, the identical payload is deduplicated"
+        );
+    }
+
+    /// A send that never reached Discord consumed none of Discord's budget, so it must not eat a slot.
+    /// Otherwise a long Discord outage would exhaust the window and delay recovery once it came back.
+    #[test]
+    fn a_failed_send_does_not_consume_a_rate_limit_slot() {
+        let mut d = Debouncer::with_limits(Duration::ZERO, 2, Duration::from_secs(60));
+        let v = view_named("a");
+
+        for i in 0..10 {
+            assert!(
+                d.may_send(PresenceAction::Set(&v), false),
+                "unrecorded attempt {i} must not consume budget"
+            );
+        }
+
+        d.record_sent(PresenceAction::Set(&v));
+        d.record_sent(PresenceAction::Clear);
+        assert!(
+            !d.may_send(PresenceAction::Set(&view_named("b")), true),
+            "two confirmed sends fill a cap of 2"
+        );
+    }
+
+    #[test]
+    fn retry_backoff_doubles_and_caps() {
+        let base = Duration::from_millis(100);
+        let max = Duration::from_millis(400);
+        let mut b = RetryBackoff::new(base, max);
+        let t0 = Instant::now();
+
+        assert!(b.ready(t0), "a fresh backoff permits the first attempt");
+
+        b.record_failure(t0);
+        assert!(!b.ready(t0));
+        assert!(b.ready(t0 + base), "100ms after the first failure");
+        assert_eq!(b.consecutive_failures(), 1);
+
+        b.record_failure(t0);
+        assert!(!b.ready(t0 + base), "second failure doubles to 200ms");
+        assert!(b.ready(t0 + 2 * base));
+
+        // Past the cap it stops growing.
+        for _ in 0..10 {
+            b.record_failure(t0);
+        }
+        assert!(b.ready(t0 + max));
+        assert_eq!(b.consecutive_failures(), 12);
+    }
+
+    #[test]
+    fn retry_backoff_success_resets() {
+        let mut b = RetryBackoff::new(Duration::from_secs(30), Duration::from_secs(60));
+        let t0 = Instant::now();
+
+        b.record_failure(t0);
+        assert!(!b.ready(t0));
+        assert_eq!(b.consecutive_failures(), 1);
+
+        b.record_success();
+        assert!(b.ready(t0), "recovery must not leave the gate closed");
+        assert_eq!(b.consecutive_failures(), 0);
+        assert_eq!(b.retry_delay(t0), Duration::ZERO);
+    }
+
+    /// `Duration::ZERO` is what the daemon tests use to exercise the retry path without sleeping, so
+    /// it has to mean "always ready".
+    #[test]
+    fn a_zero_base_backoff_never_blocks() {
+        let mut b = RetryBackoff::new(Duration::ZERO, Duration::ZERO);
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            b.record_failure(t0);
+            assert!(b.ready(t0));
+        }
     }
 
     #[test]
@@ -2304,8 +2512,8 @@ mod tests {
     fn debouncer_force_always_pushes() {
         let mut d = Debouncer::new(Duration::from_secs(60));
         let v = view_named("A");
-        assert!(d.should_push(&v, true));
-        assert!(d.should_push(&v, true));
+        assert!(push(&mut d, &v, true));
+        assert!(push(&mut d, &v, true));
     }
 
     #[test]
