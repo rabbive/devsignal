@@ -64,7 +64,10 @@ silently no longer doing its job.
   against a different config stays possible on purpose. `watch` does not take the lock.
 - **`packaging/macos/uninstall.sh`** — there was no uninstall path anywhere: no script, no subcommand,
   no docs. It unloads the LaunchAgent first, so the daemon clears Discord presence on its way out, then
-  removes the plist, binary and logs. Your config is kept unless you pass `--purge`.
+  removes the plist, binary and logs. Your config is kept unless you pass `--purge`. If the agent is
+  loaded but cannot be unloaded, it removes **nothing** and says so: deleting a running binary succeeds
+  on Unix, so carrying on would leave the daemon publishing presence while the script claimed to have
+  stopped it.
 - **A Troubleshooting section in the README**, covering presence not showing, Discord not detected,
   blank image tiles, an undetected agent CLI, the Automation permission prompt, and where the logs are.
 - `devsignal-discord` has tests for the first time, via a `PresenceIpc` trait seam — the crate was

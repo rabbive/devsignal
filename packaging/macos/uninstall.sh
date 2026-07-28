@@ -32,8 +32,41 @@ removed_anything="no"
 
 # Bootout first, so the daemon clears presence before its binary disappears from under it.
 if launchctl print "gui/$(id -u)/${LABEL}" >/dev/null 2>&1; then
-  launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null || true
-  echo "Stopped and unloaded the LaunchAgent (presence cleared)."
+  bootout_rc=0
+  bootout_err="$(launchctl bootout "gui/$(id -u)/${LABEL}" 2>&1)" || bootout_rc=$?
+
+  # `bootout` blocks until the job is unloaded, but the daemon clears presence over IPC on its way out,
+  # so give a slow SIGTERM handler a moment rather than racing it.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    launchctl print "gui/$(id -u)/${LABEL}" >/dev/null 2>&1 || break
+    sleep 0.5
+  done
+
+  # Trust the postcondition, not the exit code. `bootout` fails harmlessly if the job vanished between
+  # the check above and the call, and meaningfully on a launchd or domain error — and in that second
+  # case carrying on would delete the binary from under a *running* daemon. Unix keeps the inode alive,
+  # so the daemon would keep going and keep publishing presence while this script claimed to have
+  # cleared it. Stop instead of leaving that behind.
+  if launchctl print "gui/$(id -u)/${LABEL}" >/dev/null 2>&1; then
+    echo "Could not unload the LaunchAgent — it is still loaded." >&2
+    if [[ -n "$bootout_err" ]]; then
+      echo "  launchctl: ${bootout_err}" >&2
+    fi
+    echo "" >&2
+    echo "Nothing has been removed: the daemon is still running and still publishing presence." >&2
+    echo "Stop it and try again:" >&2
+    echo "  launchctl bootout gui/\$(id -u)/${LABEL}" >&2
+    echo "  pkill -f devsignal        # if that keeps failing" >&2
+    exit 1
+  fi
+
+  if [[ "$bootout_rc" -eq 0 ]]; then
+    echo "Stopped and unloaded the LaunchAgent (presence cleared)."
+  else
+    # Gone despite the error, so the uninstall is safe to continue — but do not claim we cleared
+    # presence, because we did not observe the shutdown that does it.
+    echo "The LaunchAgent is no longer loaded (bootout reported an error, but the job is gone)."
+  fi
   removed_anything="yes"
 else
   echo "No LaunchAgent loaded."
