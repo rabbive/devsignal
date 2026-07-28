@@ -162,6 +162,7 @@ dependencies = [
  "devsignal-discord",
  "devsignal-macos",
  "dialoguer",
+ "libc",
  "serde",
  "serde_json",
  "sysinfo",

@@ -18,6 +18,7 @@ mod cli;
 mod config_edit;
 mod config_io;
 mod init;
+mod lockfile;
 mod sink;
 
 use cli::{Cli, DetectScope, RunArgs};
@@ -558,6 +559,12 @@ fn install_signal_handler() {
 
 fn run_daemon(args: RunArgs) -> Result<()> {
     let cfg = load_config(&args.config)?;
+
+    // Only `run` takes the lock. `watch` never touches Discord, so locking it out would break the
+    // legitimate "watch what the daemon is computing while it runs" workflow. Held for the lifetime of
+    // the loop — a bare `let _` would drop it here and disable the check.
+    let _lock = lockfile::acquire(&args.config)?;
+
     let mut session = PresenceSession::new(cfg.discord.client_id.clone());
     if let Err(e) = connect_with_wait(&mut session, args.wait_for_discord) {
         // At login launchd starts devsignal before Discord has finished launching, so this is the

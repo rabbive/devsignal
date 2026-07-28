@@ -25,6 +25,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sysinfo = "0.33"
 dirs = "6"
+# Already in the dependency graph via sysinfo, so this pulls in nothing new. Used for `flock`.
+libc = "0.2"
 discord-rich-presence = "1.1"
 objc2 = "0.6"
 objc2-app-kit = "0.3"
