@@ -24,7 +24,7 @@ cargo clippy -p devsignal-core -p devsignal-discord -p devsignal-daemon --all-ta
 cargo clippy --workspace --all-targets -- -D warnings   # macOS only
 
 # Tests (only devsignal-macos requires macOS)
-cargo test -p devsignal-core -p devsignal-daemon
+cargo test -p devsignal-core -p devsignal-discord -p devsignal-daemon
 cargo test --workspace
 cargo test -p devsignal-core <test_name>
 
@@ -39,11 +39,15 @@ cargo run -p devsignal-daemon -- watch    --config ~/.config/devsignal/config.to
 cargo +1.87 check -p devsignal-core -p devsignal-discord -p devsignal-daemon --all-targets
 
 # Lint shell scripts (CI installs shellcheck)
-shellcheck packaging/macos/install.sh scripts/*.sh
+shellcheck packaging/macos/install.sh packaging/macos/uninstall.sh scripts/*.sh
 
 # Regenerate the presence art in assets/discord/ (needs: pip install pillow cairosvg)
 python3 scripts/build-discord-assets.py
 python3 scripts/build-discord-assets.py --check   # fail if the committed PNGs drifted
+
+# Uninstall everything (unloads the LaunchAgent first, so presence clears)
+./packaging/macos/uninstall.sh            # asks before deleting the config
+./packaging/macos/uninstall.sh --purge    # config too
 
 # Guided setup wizard (writes config, optionally installs LaunchAgent)
 cargo run -p devsignal-daemon -- init
@@ -52,16 +56,19 @@ cargo run -p devsignal-daemon -- init
 ./scripts/setup-local-config.sh
 ```
 
-CI (`.github/workflows/ci.yml`) has three jobs: `lint` (Linux) runs `cargo fmt --check`, clippy, tests,
+CI (`.github/workflows/ci.yml`) has four jobs: `lint` (Linux) runs `cargo fmt --check`, clippy, tests,
 and `shellcheck` for every crate except `devsignal-macos`; `msrv` builds against exactly the declared
 `rust-version` so that claim stays checked; `macos` runs workspace clippy, `cargo test`, and a release
-build.
+build; `audit` runs `cargo audit` with `continue-on-error`, so a new advisory against a transitive
+dependency does **not** block merge — but it still reports a red check, which is the point: advisories
+appear on their own schedule and can turn this red on a PR that changed nothing. All jobs use
+`Swatinem/rust-cache` and pass `--locked`, so lockfile drift fails everywhere rather than only in `msrv`.
 MSRV is Rust **1.87** (`workspace.package.rust-version`) — determined empirically; the floor comes
 from the dependency graph as much as from our code. `Cargo.lock` is committed.
 
 `.github/workflows/release.yml` builds a universal macOS binary (`lipo` of aarch64 + x86_64) on `v*`
 tags, signing/notarizing when Apple credentials are present and publishing `SHA256SUMS`.
-`packaging/macos/` holds the LaunchAgent plist template and `install.sh`.
+`packaging/macos/` holds the LaunchAgent plist template, `install.sh`, and `uninstall.sh`.
 
 ## Architecture
 
@@ -69,18 +76,21 @@ Rust workspace, 4 crates under `crates/`:
 
 | Crate | Role |
 |---|---|
-| `devsignal-core` | Config/TOML, agent matching, host labels + icons, presence rules, line layout, image resolution, `PresenceView`, `Debouncer` — no OS or Discord deps |
+| `devsignal-core` | Config/TOML, agent matching, host labels + icons, presence rules, line layout, image resolution, `PresenceView`, `Debouncer`, `RetryBackoff` — no OS or Discord deps |
 | `devsignal-macos` | `frontmost_bundle_id()` via AppKit `NSWorkspace` (`objc2`); falls back to `osascript` after two consecutive native misses |
-| `devsignal-discord` | `PresenceSession` wrapping `discord-rich-presence`; `set_presence_resilient` / `clear_presence_resilient` (one reconnect on failure) |
+| `devsignal-discord` | `PresenceSession` wrapping `discord-rich-presence`; `set_presence_resilient` / `clear_presence_resilient` (**returning `Result`**) recover via `reestablish` — one `reconnect()`, then a plain `connect()`, because `reconnect()` cannot revive a client that never connected — all behind a `PresenceIpc` trait so the policy is testable without a Discord client |
 | `devsignal-daemon` | Binary `devsignal`: hand-rolled CLI parsing, `init` wizard, config-edit subcommands, poll loop |
 
 `devsignal-daemon` modules:
 
-- `main.rs` — command dispatch, `run_loop`/`run_forever`, `build_policy_view`, `collect_matches`,
-  `maybe_reload_config`, and the `validate`/`once`/`detect`/`watch` commands
+- `main.rs` — command dispatch, `run_loop`/`run_forever`/`tick`/`push`, `build_policy_view`,
+  `collect_matches`, `maybe_reload_config`, and the `validate`/`once`/`detect`/`watch` commands
 - `cli.rs` — argument parsing and help/version text; no platform gating, so CI lints and tests it
-- `sink.rs` — `PresenceSink` with `DiscordSink` (real IPC) and `StdoutSink` (backs `watch`); the seam
-  that makes the poll loop, including shutdown-and-clear, testable without a Discord client
+- `sink.rs` — `PresenceSink` (both methods return `Result`) with `DiscordSink` (real IPC),
+  `StdoutSink` (backs `watch`), and `ScriptedSink` (test-only, scripted failures); the seam that makes
+  the poll loop — shutdown-and-clear and the retry paths alike — testable without a Discord client
+- `lockfile.rs` — advisory `flock` beside the config so a second `devsignal run` refuses to start
+  rather than fighting the first over the Discord card
 - `config_io.rs` — `write_config_atomic`: serialize → round-trip → validate → temp file → rename
 - `init.rs` — interactive `devsignal init` wizard (`dialoguer` + `console`): Discord app ID, privacy
   preset, agent multi-select, host multi-select, optional rule presets, then optional copy to
@@ -107,8 +117,9 @@ Rust workspace, 4 crates under `crates/`:
    the `ActiveAgent` plus its PID.
 4. Agent-id change (`transition`) resets `session_start_unix` to now, so the Discord elapsed timer
    restarts per agent session.
-5. If no agent matched and `idle_mode = "clear"`, the loop clears presence — through the debouncer,
-   which this branch used to bypass entirely — and skips the rest of the tick.
+5. If no agent matched and `idle_mode = "clear"`, the loop clears presence — through the same `push`
+   helper as the `Set` path, which is how both share the debouncer and the retry backoff. This branch
+   used to bypass the debouncer entirely, and later had its own copy of the wedge in step 9.
 6. `show_cwd_basename` optionally resolves the winning PID's CWD through `redact_cwd_basename`.
 7. `devsignal_macos::frontmost_bundle_id()` gets the focused app's bundle ID. AppKit first; after two
    consecutive misses it falls back to a **time-boxed** `osascript` (2s, killed on timeout) with
@@ -120,21 +131,47 @@ Rust workspace, 4 crates under `crates/`:
    `PresenceInputs::hide_host`, where the `Host` line slot renders the neutral fallback
    (`Working · myrepo`) and the host icon is suppressed. Returns the matched rule name alongside the
    view — **not** on `PresenceView`, which is the debouncer's equality key.
-9. `Debouncer::should_send` takes a `PresenceAction` (`Set` or `Clear`) so both paths share one
-   limiter. It suppresses an unchanged payload or one inside `min_push_interval_secs`, and enforces a
-   sliding window of 5 sends per 20s — Discord's documented limit — **even when `force` is set**.
-   `force` is set on agent transitions, the first tick, and after a config reload.
-10. The `PresenceSink` sends it: Discord IPC under `run`, stdout under `watch`.
+9. `push` makes one attempt, in this order — and the order is the whole point:
+   1. `RetryBackoff::ready` — skip entirely while waiting out a previous failure.
+   2. `Debouncer::may_send(action, force)` — suppresses an unchanged payload or one inside
+      `min_push_interval_secs`, and enforces a sliding window of 5 sends per 20s (Discord's documented
+      limit) **even when `force` is set**. `force` is set on agent transitions, the first tick, after a
+      config reload, and — critically — whenever `backoff.consecutive_failures() > 0`, because an
+      unacknowledged push means the dedupe key no longer describes what Discord is showing. `may_send`
+      does **not** record.
+   3. The `PresenceSink`, which now returns `Result`: Discord IPC under `run`, stdout under `watch`.
+   4. On `Ok`, `Debouncer::record_sent` **and** `RetryBackoff::record_success`; on `Err`,
+      `RetryBackoff::record_failure` and nothing recorded in the debouncer.
 
-On SIGINT/SIGTERM the `RUNNING` atomic flips false → loop exits → the sink clears. That final clear is
-the one deliberate bypass of the debouncer. `sleep_interruptible` sleeps in 200ms slices so shutdown
-does not wait out `poll_interval_secs` (which has no upper bound). `connect_with_wait` retries IPC with
-exponential backoff up to 30s when `--wait-for-discord` (the default) is set.
+   Step 4 is the fix for the wedge that made quitting Discord kill presence permanently: recording at
+   step 2 marked a failed push as delivered, so the next tick deduplicated against a payload Discord
+   never received, the sink was never called again, and the reconnect inside it never fired. Leaving
+   the dedupe key untouched on failure is what lets the next tick retry; `RetryBackoff` (400ms → 60s,
+   doubling) is what stops that retry from reopening a dead socket every `poll_interval_secs`.
+   Recovery needs no separate code path — the current view is simply what lands once a send succeeds.
+10. Failures log on **transition only**: `warn!` on the first, `debug!` after, `info!` on recovery. The
+    launchd log has no rotation, so a day with Discord closed would otherwise fill it.
+
+One tick is `tick()`, extracted from `run_forever` so these failure paths are unit-testable without
+subprocesses or signals. On SIGINT/SIGTERM the `RUNNING` atomic flips false → loop exits → the sink
+clears. That final clear is the one deliberate bypass of both the debouncer *and* the backoff — a skip
+or a retry there would delay exit. `sleep_interruptible` sleeps in 200ms slices so shutdown does not
+wait out `poll_interval_secs` (which has no upper bound). `connect_with_wait` retries IPC with
+exponential backoff up to 30s when `--wait-for-discord` (the default) is set, and a timeout there is
+**not** fatal: launchd starts devsignal before Discord finishes launching at login, so exiting 1 meant
+`KeepAlive` respawning every 10s forever. The loop retries instead. `--no-wait-for-discord` still fails
+fast for scripts.
+
+`run` also takes an advisory `flock` beside its config (`lockfile.rs`) and refuses to start if another
+daemon holds it — two daemons would both push and fight over the card. `watch` deliberately does not.
 
 Three integration tests cover this loop, all running on Linux: `tests/shutdown.rs` (SIGTERM and SIGINT
 each exit 0 *and* emit a clear), `tests/detection.rs` (an agent is released when it exits), and
-`tests/hot_reload.rs` (an invalid edit is ignored without killing the daemon). Each was verified to
-fail when its fix is reverted.
+`tests/hot_reload.rs` (an invalid edit is ignored without killing the daemon). The retry paths are
+covered by unit tests driving `tick()` with a `ScriptedSink` instead, because a sink reached through
+the shipped binary cannot be made to fail without a production test hook. Each was verified to fail
+when its fix is reverted — reverting the record-on-confirmation split drops
+`a_failed_push_is_retried_on_a_later_tick` from 3 attempts to 1.
 
 ### CLI surface
 
@@ -176,6 +213,21 @@ to stdout. Platform gating is a runtime check in `require_macos`, applied only t
   why `matched_rule_name` is **not** a field on it: a rule-name change alone would trigger a Discord
   write with identical visible text. It also owns the 5-per-20s rate limit, which applies to forced
   sends too — `force` keeps transitions responsive, it does not license unbounded IPC traffic.
+- Deduplication **expires** after `REASSERT_INTERVAL` (60s), so an unchanged payload is re-sent rather
+  than suppressed forever. Dedupe assumes Discord still shows the last confirmed payload, and nothing
+  signals when that stops being true — a Discord that quit and reopened has no activity and no way to say
+  so. Without the expiry a user with a static view (one terminal, unchanged host label) never got
+  presence back, and the daemon never even attempted a send to *discover* Discord was gone. A re-assert
+  still respects `min_push_interval_secs`, so the effective period is `max(60s, min_interval)`.
+- The dedupe key is also bypassed while a failure is outstanding (see main-loop step 9.2). Trusting it
+  during an outage reopens the wedge through a narrower door: send A, fail on B, let the view return to
+  A, and the retry is deduplicated against a payload Discord may never have received.
+- The debouncer is **two-phase**: `may_send` asks, `record_sent` confirms, and only the daemon's success
+  branch calls the second. Recording at check time is a silent-wedge generator — the payload is marked
+  delivered whether or not it arrived. A failed send therefore records *nothing*, not even a rate-limit
+  slot: it consumed none of Discord's budget. A caller that forgets `record_sent` loses dedupe entirely
+  and writes every tick, which is why `a_successful_push_is_still_debounced` exists alongside the retry
+  tests.
 - `show_cwd_basename` redacts to the last path segment only (`redact_cwd_basename`, which also
   rejects `.` and single-component roots); full paths never reach Discord.
 - Discord's card is three lines: **activity name**, `details`, `state`. The name line is the Discord
@@ -307,22 +359,28 @@ raw bundle id would be a 404 in url mode).
   `feat(init):`).
 - `docs/superpowers/plans/` holds dated design plans for larger features; `README.md` carries the
   user-facing architecture and install docs and should be kept in sync with structural changes.
-- v0.3.0 is merged but **not tagged** — `Cargo.toml` says `0.3.0`, `CHANGELOG.md` still says
-  `unreleased`, and the newest tag is `v0.2.0`. These are **unverified** because each needs a Mac or
-  the maintainer's Apple credentials, and none should be assumed done:
-  1. The ten process names in `docs/community-presets.md` are inferred and have never been run.
-     Confirm with `devsignal detect --unmatched` while each CLI is running, then promote into
-     `agent_presets()` **and** `config.example.toml` — the drift test fails if only one is updated.
-  2. The launchd → Discord loop is **half confirmed**: the maintainer ran a 0.3.0 build on a Mac and
-     saw presence appear in the real client (`devsignal / Claude Code / In Ghostty`, which is what
-     prompted the `[presence]` work). Still unconfirmed:
-     `launchctl bootout gui/$(id -u)/com.devsignal.daemon` → presence clears in the actual client.
-  3. Signing and notarization have never executed. They need five repo secrets —
-     `APPLE_CERT_P12_BASE64`, `APPLE_CERT_PASSWORD`, `APPLE_NOTARY_API_KEY`, `APPLE_NOTARY_KEY_ID`,
-     `APPLE_NOTARY_ISSUER_ID` — all five or none, since a partial set is a hard error by design. Use
-     the release workflow's `workflow_dispatch` trigger to dry-run the whole pipeline first, so the
-     first real tag is not also signing's first execution.
-  4. `install.sh` against a real v0.3.0 release, including the Gatekeeper path.
+- **v0.3.0 shipped** on 2026-07-25 (tag `v0.3.0`, GitHub release with a universal tarball,
+  `SHA256SUMS`, and the plist). It was published **unsigned**: the release workflow took its
+  zero-secrets branch, and the shipped binary's x86_64 slice carries no `LC_CODE_SIGNATURE` while the
+  arm64 slice carries only the linker's mandatory ad-hoc one. Treat unsigned as the shipping reality
+  until the five secrets below exist.
+- These remain **unverified** because each needs a Mac with a real Discord client, and none should be
+  assumed done:
+  1. **Discord restart recovery** (0.4.0's headline fix). Quit Discord while the daemon runs, wait past
+     `min_push_interval_secs`, reopen it → presence must come back on its own. No longer depends on
+     `DiscordIpcClient::reconnect()` behaving: `reestablish` in `devsignal-discord` falls back to a
+     plain `connect()` when `reconnect()` fails. That fallback is **required**, not belt-and-braces —
+     `reconnect()` starts with `close()`, which returns `Err(NotConnected)` when there is no socket, so
+     it can never recover a client that never connected.
+  2. **Login with Discord not running** → the daemon stays up and connects once Discord appears, with
+     no respawn loop in the log.
+  3. `launchctl bootout gui/$(id -u)/com.devsignal.daemon` → presence clears in the actual client. The
+     launchd → Discord loop is **half confirmed**: presence *appearing* was seen on a 0.3.0 build
+     (`devsignal / Claude Code / In Ghostty`, which is what prompted the `[presence]` work); clearing
+     was not.
+  4. **Two instances**: `devsignal run` while the LaunchAgent is loaded → refused, message names the
+     holder's pid. Only the single-process flock semantics are covered by tests, because `run` is
+     `require_macos`-gated.
   5. **Whether Discord honours the activity `name` override.** `presence.name = "agent"` sets the
      activity `name` field, which `discord-rich-presence` documents as overriding the application
      name; no client has been checked. If line 1 still reads `devsignal`, the fallback is renaming the
@@ -332,9 +390,30 @@ raw bundle id would be a 404 in url mode).
      URLs are documented and used by comparable tools, but blank tiles are the failure mode either
      way, so this cannot regress an un-uploaded key setup. Verify both slots before recommending url
      mode as *the* path in the README rather than one of two.
+  7. `install.sh` against a real release on a machine that has never run the binary (the Gatekeeper
+     path), then `uninstall.sh`.
+  8. The ten process names in `docs/community-presets.md` are inferred and have never been run.
+     Confirm with `devsignal detect --unmatched` while each CLI is running, then promote into
+     `agent_presets()` **and** `config.example.toml` **and** `assets/discord/agents/<id>.png` — the
+     drift tests check every direction, so none can be forgotten.
+  9. Signing and notarization have never executed. They need five repo secrets —
+     `APPLE_CERT_P12_BASE64`, `APPLE_CERT_PASSWORD`, `APPLE_NOTARY_API_KEY`, `APPLE_NOTARY_KEY_ID`,
+     `APPLE_NOTARY_ISSUER_ID` — all five or none, since a partial set is a hard error by design. Use
+     the release workflow's `workflow_dispatch` trigger to dry-run the whole pipeline first, so the
+     first real tag is not also signing's first execution.
 
-  Then date the `CHANGELOG.md` heading and tag. The release workflow fails if the tag disagrees with
-  `Cargo.toml`, so bump both together.
+  To cut a release: date the `CHANGELOG.md` heading and bump `Cargo.toml` together — the release
+  workflow fails if the tag disagrees with the crate version.
+- Settled during 0.4.0; do not re-litigate:
+  - launchd's `ThrottleInterval` **defaults to 10s**, so a missing key was a respawn every 10s, not an
+    unthrottled storm.
+  - `Instant` on macOS does **not** advance across sleep, so the debouncer's rate-limit window looks
+    *fresh* after a wake rather than ancient, and self-corrects within one window. Nothing to fix.
+  - `session_start_unix` does over-count across sleep (it is wall clock), but fixing it needs IOKit
+    sleep/wake notifications that cannot live in platform-free `devsignal-core`. Cosmetic; skipped.
+  - `KeepAlive` stays `true` rather than a `SuccessfulExit` dict: a Rust panic exits 101, so exit codes
+    cannot separate "crashed, restart" from "misconfigured, don't". `install.sh` validates the config
+    before bootstrapping instead.
 
 ## Learned preferences
 

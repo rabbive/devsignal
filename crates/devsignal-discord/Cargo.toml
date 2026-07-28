@@ -9,4 +9,3 @@ description = "Discord Rich Presence IPC wrapper for devsignal"
 anyhow.workspace = true
 devsignal-core = { path = "../devsignal-core" }
 discord-rich-presence.workspace = true
-tracing.workspace = true

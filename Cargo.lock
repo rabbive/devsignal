@@ -22,9 +22,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "autocfg"
@@ -116,9 +116,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "devsignal-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -152,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "devsignal-daemon"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -162,6 +162,7 @@ dependencies = [
  "devsignal-discord",
  "devsignal-macos",
  "dialoguer",
+ "libc",
  "serde",
  "serde_json",
  "sysinfo",
@@ -173,17 +174,16 @@ dependencies = [
 
 [[package]]
 name = "devsignal-discord"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "devsignal-core",
  "discord-rich-presence",
- "tracing",
 ]
 
 [[package]]
 name = "devsignal-macos"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "objc2",
  "objc2-app-kit",

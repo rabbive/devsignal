@@ -121,12 +121,33 @@ It downloads the release tarball, **verifies it against the published `SHA256SUM
 `~/.config/devsignal/config.toml` if missing, and — when run interactively — offers to load the
 LaunchAgent. Under `curl | bash` there is no TTY, so it points you at `devsignal init` instead.
 
+### Uninstall
+
+```bash
+./packaging/macos/uninstall.sh              # asks before deleting your config
+./packaging/macos/uninstall.sh --purge      # delete the config too
+./packaging/macos/uninstall.sh --keep-config
+```
+
+Or standalone, without a clone:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rabbive/devsignal/main/packaging/macos/uninstall.sh | bash -s -- --keep-config
+```
+
+It unloads the LaunchAgent first, so the daemon clears Discord presence on its way out, then removes
+`~/Library/LaunchAgents/com.devsignal.daemon.plist`, `~/bin/devsignal`, and
+`~/Library/Logs/devsignal`. `~/.config/devsignal` is kept unless you ask for it to go — it holds your
+Discord application id and any rules you wrote.
+
 ### Gatekeeper and code signing
 
-Release binaries are signed and notarized when the maintainer's Apple credentials are configured in
-CI; the workflow falls back to publishing an **unsigned** binary otherwise, and says so in the run
-log. macOS quarantines anything downloaded either way, so if you install by hand rather than with
-`install.sh`, clear the attribute:
+**Published releases are currently unsigned.** The release workflow signs and notarizes only when the
+maintainer's Apple credentials are configured in CI, and they are not; with none configured it
+publishes an unsigned binary and says so in the run log. Since macOS quarantines anything downloaded,
+an unsigned binary is blocked outright until the attribute is cleared.
+
+`install.sh` clears it for you. If you install by hand, do it yourself:
 
 ```bash
 xattr -d com.apple.quarantine ~/bin/devsignal
@@ -355,9 +376,82 @@ Press **Ctrl+C** (or send **SIGTERM**): the daemon clears Discord presence for t
 
 Other platforms fail fast until host detection and packaging are added.
 
+## Troubleshooting
+
+**Where are the logs?** `~/Library/Logs/devsignal/devsignal.err.log` under the LaunchAgent (all
+`tracing` output goes to stderr; the `.out.log` file stays near-empty). The plist sets `RUST_LOG=warn`;
+raise it to `info` or `debug` there while diagnosing something, and lower it again afterwards — launchd
+appends to these files forever with no rotation.
+
+**Nothing appears in Discord.**
+
+1. `devsignal detect` — does it name your agent CLI and a matched rule? If not, see below.
+2. `devsignal validate` — a config that fails to load stops everything. Since v0.3.0 unknown keys are
+   an error, so a typo'd key is named explicitly.
+3. Is the Discord **desktop app** running? The browser client has no IPC socket and cannot work.
+4. Check `discord.client_id` against the application id in the
+   [Developer Portal](https://discord.com/developers/applications). Presence is published *as* that
+   application; a wrong id publishes to something you are not looking at.
+5. Discord's "Activity Privacy" → *Share your detected activities with others* must be on.
+
+**Presence stopped updating after I restarted Discord.** Fixed in 0.4.0. Earlier versions recorded a
+failed push as delivered and then deduplicated against it forever, so the daemon stayed alive and
+silent. If you are on 0.4.0 or later and still see this, the log will contain
+`presence push failed; will keep retrying` — attach that.
+
+**My agent CLI is not detected.** Run it, then:
+
+```bash
+devsignal detect --unmatched     # processes no rule matched
+```
+
+Find its process name in that list and add it with `devsignal agents add --id myagent --process-name
+<name>`. Wrapped Node CLIs are matched on `basename(argv[0])` too, so `node .../codex` matches
+`codex`. `docs/community-presets.md` has snippets for CLIs whose names are not yet confirmed.
+
+**The tiles are blank.** With `images.mode = "key"` (the default) every image name must be uploaded as
+an art asset in the Developer Portal — an un-uploaded key renders as an empty tile with nothing in the
+logs. `devsignal validate` prints the keys to upload. `mode = "url"` serves the PNGs from this repo
+instead and needs no uploads.
+
+**The first line says "devsignal" instead of my agent.** That line is the Discord *application's* name.
+Set `presence.name = "agent"` to override it; if your client ignores the override, rename the
+application in the Developer Portal instead.
+
+**"another devsignal is already running".** Two daemons would fight over the card, so the second one
+refuses to start. Usually a hand-run `devsignal run` while the LaunchAgent is loaded:
+
+```bash
+launchctl bootout gui/$(id -u)/com.devsignal.daemon    # stop the background one
+pgrep -fl devsignal                                    # or find it directly
+```
+
+**macOS keeps asking for Automation permission.** Host detection prefers AppKit; only after two
+consecutive misses does it fall back to AppleScript against System Events, which needs that permission.
+Granting it to whichever app launches `devsignal` stops the prompts.
+
+**How do I remove it?** See [Uninstall](#uninstall).
+
 ## Maintainer notes: signing / notarization
 
-The default [`.github/workflows/release.yml`](.github/workflows/release.yml) ships an **unsigned** universal binary. To ship a signed build, run `codesign` / `notarytool` locally or extend the workflow with your Apple Developer certificates and API key (see Apple’s *Notarizing macOS software* guide).
+[`.github/workflows/release.yml`](.github/workflows/release.yml) already implements signing **and**
+notarization; it is gated on five repository secrets:
+
+| Secret | Purpose |
+|---|---|
+| `APPLE_CERT_P12_BASE64` | base64 of the Developer ID Application certificate (`.p12`) |
+| `APPLE_CERT_PASSWORD` | its export password |
+| `APPLE_NOTARY_API_KEY` | App Store Connect API key (`.p8`) contents |
+| `APPLE_NOTARY_KEY_ID` | that key's id |
+| `APPLE_NOTARY_ISSUER_ID` | the issuer id |
+
+Set **all five or none**: a partial set is a hard error by design, so a half-configured repo fails
+loudly instead of quietly shipping unsigned. With none set the workflow publishes an unsigned binary
+and emits a warning annotation — which is the current state of published releases.
+
+Notarization tickets cannot be stapled to a bare executable, so Gatekeeper performs an online check on
+first run. Use the workflow's `workflow_dispatch` trigger to dry-run the whole pipeline before a real
+tag, so signing's first execution is not also a release.
 
 ## License
 

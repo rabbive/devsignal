@@ -36,7 +36,13 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 echo "Installing devsignal ${VERSION} from ${REPO}"
-curl -fL -o "${TMP}/${TARBALL}" "${BASE_URL}/${TARBALL}"
+if ! curl -fL --retry 3 --retry-delay 2 -o "${TMP}/${TARBALL}" "${BASE_URL}/${TARBALL}"; then
+  echo "" >&2
+  echo "Could not download ${TARBALL} from ${BASE_URL}." >&2
+  echo "Check that ${TAG} exists and has a macOS universal asset:" >&2
+  echo "  https://github.com/${REPO}/releases" >&2
+  exit 1
+fi
 
 # Verify against the published SHA256SUMS. Releases before v0.3.0 have no such asset, so a missing
 # file is a warning rather than a failure; a checksum that is present and wrong is always fatal.
@@ -113,7 +119,15 @@ echo ""
 # Only offer the interactive LaunchAgent step when there is a TTY to answer it. Under `curl | bash`
 # stdin is the script itself, so a `read` would consume script text instead of user input.
 if [[ ! -t 0 ]]; then
-  echo "Run 'devsignal init' to set up autostart (LaunchAgent)."
+  # An upgrade over `curl | bash` has no TTY to answer the autostart prompt, but a LaunchAgent that is
+  # already loaded is still running the *old* binary. Restarting it here is the difference between an
+  # upgrade taking effect now and taking effect at next login, with no indication which one happened.
+  if launchctl print "gui/$(id -u)/com.devsignal.daemon" >/dev/null 2>&1; then
+    launchctl kickstart -k "gui/$(id -u)/com.devsignal.daemon"
+    echo "Restarted the running LaunchAgent on the new binary."
+  else
+    echo "Run 'devsignal init' to set up autostart (LaunchAgent)."
+  fi
   exit 0
 fi
 
@@ -131,23 +145,23 @@ if ! fetch_support_file "packaging/macos/com.devsignal.daemon.example.plist" "$P
 fi
 
 mkdir -p "$(dirname "$PLIST_DST")"
-# Pass --config explicitly so the agent does not depend on the default path resolving the same way
-# under launchd (which runs with a minimal environment). This matches what `devsignal init` writes.
+# The template carries `--config` with a placeholder path, so plain `sed` finishes the job. This used
+# to need a python3 `plistlib` pass that ran *after* sed had already written the file, so on a machine
+# without python3 the install left behind a plist with no --config at all.
 sed -e "s|/REPLACE/WITH/ABSOLUTE/PATH/TO/devsignal|${HOME}/bin/devsignal|g" \
+    -e "s|REPLACE_CONFIG_PATH|${CFG_FILE}|g" \
     -e "s|REPLACE_HOME|${HOME}|g" \
     "$PLIST_SRC" > "$PLIST_DST"
-python3 - "$PLIST_DST" "${CFG_FILE}" <<'PY'
-import plistlib, sys
-path, cfg = sys.argv[1], sys.argv[2]
-with open(path, "rb") as fh:
-    plist = plistlib.load(fh)
-args = plist.get("ProgramArguments", [])
-if "--config" not in args:
-    args = [args[0] if args else ""] + ["--config", cfg]
-    plist["ProgramArguments"] = args
-with open(path, "wb") as fh:
-    plistlib.dump(plist, fh)
-PY
+
+# Never bootstrap a job that cannot start. `KeepAlive` restarts the daemon on any nonzero exit, and
+# an unloadable config is a permanent failure, so installing one means a respawn every minute until
+# the user notices. Exit codes cannot tell launchd the difference, so check here instead.
+if ! "${HOME}/bin/devsignal" validate --config "$CFG_FILE" >/dev/null 2>&1; then
+  echo "Not loading the LaunchAgent: ${CFG_FILE} does not validate." >&2
+  echo "Fix it (or run 'devsignal init'), then re-run this script. The error was:" >&2
+  "${HOME}/bin/devsignal" validate --config "$CFG_FILE" >&2 || true
+  exit 1
+fi
 
 launchctl bootout "gui/$(id -u)/com.devsignal.daemon" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST_DST"

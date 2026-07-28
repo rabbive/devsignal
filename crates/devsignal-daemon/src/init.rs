@@ -758,6 +758,35 @@ mod tests {
         assert_eq!(plist.matches("</plist>").count(), 1);
     }
 
+    /// `KeepAlive` restarts the daemon on any nonzero exit, and exit codes cannot tell launchd that a
+    /// failure is permanent — a Rust panic exits 101 like anything else. Without this key launchd
+    /// respawns at its 10-second default, so a daemon that cannot start burns a process every 10s
+    /// indefinitely.
+    #[test]
+    fn generated_plist_throttles_respawns() {
+        std::env::set_var("HOME", "/Users/demo");
+        let plist = generate_launch_agent_plist(
+            Path::new("/Users/demo/bin/devsignal"),
+            Path::new("/Users/demo/.config/devsignal/config.toml"),
+        )
+        .expect("generate");
+
+        assert!(
+            plist.contains("<key>ThrottleInterval</key>"),
+            "the wizard's plist must throttle respawns"
+        );
+        assert!(
+            plist.contains("<integer>60</integer>"),
+            "ThrottleInterval should be 60 seconds"
+        );
+        // Quiet by default: the launchd log has no rotation, and failures already log on transition
+        // rather than per retry.
+        assert!(
+            plist.contains("<string>warn</string>"),
+            "RUST_LOG should default to warn under launchd"
+        );
+    }
+
     #[test]
     fn generated_plist_escapes_xml_significant_characters() {
         std::env::set_var("HOME", "/Users/a&b");

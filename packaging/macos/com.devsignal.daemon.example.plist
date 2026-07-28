@@ -6,10 +6,12 @@
 
   Placeholders substituted at install time:
     /REPLACE/WITH/ABSOLUTE/PATH/TO/devsignal  absolute path to the binary
+    REPLACE_CONFIG_PATH                       absolute path to config.toml
     REPLACE_HOME                              your home directory
 
-  Note: XML comments cannot contain a double hyphen, so command lines with flags
-  are documented in README.md rather than here.
+  The config path is passed explicitly because launchd runs with a minimal environment, so the
+  daemon must not depend on resolving the default path itself. Note that XML comments cannot
+  contain a double hyphen, so flags are described in README.md rather than here.
 -->
 <plist version="1.0">
 <dict>
@@ -19,6 +21,8 @@
   <key>ProgramArguments</key>
   <array>
     <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/devsignal</string>
+    <string>--config</string>
+    <string>REPLACE_CONFIG_PATH</string>
   </array>
 
   <key>RunAtLoad</key>
@@ -27,16 +31,32 @@
   <key>KeepAlive</key>
   <true/>
 
+  <!--
+    launchd already refuses to respawn faster than every 10 seconds; this slows that to a minute.
+    A daemon that cannot start at all (an unloadable config, say) is a permanent failure, and exit
+    codes cannot tell launchd so: a Rust panic exits 101, indistinguishable from any other error.
+    install.sh therefore validates the config before bootstrapping the job, and this key keeps the
+    cost low if something still goes wrong.
+  -->
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+
   <key>StandardOutPath</key>
   <string>REPLACE_HOME/Library/Logs/devsignal/devsignal.out.log</string>
 
   <key>StandardErrorPath</key>
   <string>REPLACE_HOME/Library/Logs/devsignal/devsignal.err.log</string>
 
+  <!--
+    launchd appends to these forever with no rotation, so keep the daemon quiet by default. The poll
+    loop logs per tick at debug, and repeated failures are logged once on transition rather than
+    every retry, so `warn` still surfaces anything worth seeing. Raise to info or debug while
+    diagnosing something.
+  -->
   <key>EnvironmentVariables</key>
   <dict>
     <key>RUST_LOG</key>
-    <string>info</string>
+    <string>warn</string>
   </dict>
 </dict>
 </plist>

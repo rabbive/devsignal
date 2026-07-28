@@ -4,7 +4,7 @@ use devsignal_core::{
     agent_allowed, apply_rules, build_presence_view, host_allowed, host_label_for_bundle,
     process_matches_rule, redact_cwd_basename, select_active_agent, ActiveAgent, AgentRule, Config,
     Debouncer, IdleMode, ImageMode, PresenceAction, PresenceInputs, PresencePolicyOverride,
-    PresenceView, RuleContext,
+    PresenceView, RetryBackoff, RuleContext,
 };
 use devsignal_discord::PresenceSession;
 use std::io::IsTerminal;
@@ -18,6 +18,7 @@ mod cli;
 mod config_edit;
 mod config_io;
 mod init;
+mod lockfile;
 mod sink;
 
 use cli::{Cli, DetectScope, RunArgs};
@@ -558,8 +559,26 @@ fn install_signal_handler() {
 
 fn run_daemon(args: RunArgs) -> Result<()> {
     let cfg = load_config(&args.config)?;
+
+    // Only `run` takes the lock. `watch` never touches Discord, so locking it out would break the
+    // legitimate "watch what the daemon is computing while it runs" workflow. Held for the lifetime of
+    // the loop — a bare `let _` would drop it here and disable the check.
+    let _lock = lockfile::acquire(&args.config)?;
+
     let mut session = PresenceSession::new(cfg.discord.client_id.clone());
-    connect_with_wait(&mut session, args.wait_for_discord).context("ipc connect")?;
+    if let Err(e) = connect_with_wait(&mut session, args.wait_for_discord) {
+        // At login launchd starts devsignal before Discord has finished launching, so this is the
+        // common case, not an edge case. Failing here meant exit 1, and `KeepAlive` respawning the
+        // daemon every 10 seconds forever. The poll loop retries with backoff, so enter it anyway.
+        // `--no-wait-for-discord` keeps its fail-fast contract for scripts.
+        if !args.wait_for_discord {
+            return Err(e).context("ipc connect");
+        }
+        warn!(
+            error = %format!("{e:#}"),
+            "Discord not reachable at startup; the poll loop will keep retrying"
+        );
+    }
     info!(config = %args.config.display(), version = env!("CARGO_PKG_VERSION"), "devsignal running");
     run_loop(args.config, cfg, Box::new(DiscordSink::new(session)))
 }
@@ -593,6 +612,7 @@ fn run_loop(config_path: PathBuf, cfg: Config, sink: Box<dyn PresenceSink>) -> R
         sink,
         sys: System::new(),
         debouncer,
+        backoff: RetryBackoff::default(),
         last_agent_id: None,
         session_start_unix: None,
         poll,
@@ -610,6 +630,8 @@ struct RunState {
     sink: Box<dyn PresenceSink>,
     sys: System,
     debouncer: Debouncer,
+    /// Paces retries after a failed push, so a closed Discord is not reopened every poll interval.
+    backoff: RetryBackoff,
     last_agent_id: Option<String>,
     session_start_unix: Option<u64>,
     poll: Duration,
@@ -655,90 +677,153 @@ fn maybe_reload_config(state: &mut RunState) -> bool {
     true
 }
 
-fn run_forever(mut state: RunState) {
-    while RUNNING.load(Ordering::SeqCst) {
-        let reloaded = maybe_reload_config(&mut state);
-        refresh_processes(&mut state.sys, state.cfg.show_cwd_basename);
+/// One attempt at telling Discord something.
+///
+/// Ordering matters. The retry backoff is consulted first, then the debouncer, then the sink — and the
+/// debouncer is told the send happened only once the sink confirms it. Recording an unconfirmed send is
+/// what used to wedge the daemon: a failed push was marked as delivered, the next tick deduplicated
+/// against it, and the sink was never called again, so the reconnect inside it never fired.
+fn push(state: &mut RunState, action: PresenceAction<'_>, force: bool) {
+    let now = Instant::now();
+    if !state.backoff.ready(now) {
+        debug!(
+            failures = state.backoff.consecutive_failures(),
+            "skipping presence push; waiting out the retry backoff"
+        );
+        return;
+    }
 
-        let candidates = collect_matches(&state.sys, &state.cfg);
-        let selected = winner_of(&candidates);
+    // While a push is unacknowledged, the debouncer's dedupe key describes the last payload Discord
+    // *confirmed* — not what it is showing now, which we no longer know. Trusting it here reopens the
+    // wedge through a narrower door: send A, fail on B, then have the view return to A, and the retry
+    // is deduplicated against a payload Discord may never have received.
+    let recovering = state.backoff.consecutive_failures() > 0;
 
-        let agent_id = selected.as_ref().map(|(a, _)| a.id.clone());
-        let transition = agent_id != state.last_agent_id;
-        if transition {
-            debug!(?agent_id, candidates = candidates.len(), "agent transition");
+    if !state.debouncer.may_send(action, force || recovering) {
+        // Keep this tied to a real transition. A refused *forced* send can only be the rate limit —
+        // force already skips the equality check and the minimum interval — but a refused retry is
+        // routine and must not warn on every backoff-ready tick during an outage.
+        if force {
+            warn!("presence update suppressed by the Discord rate limit; is an agent process flapping?");
         }
+        return;
+    }
 
-        let entered_idle_clear = selected.is_none() && state.cfg.idle_mode == IdleMode::Clear;
-
-        if entered_idle_clear {
-            let force = transition || state.first_tick || reloaded;
-            if state.debouncer.should_send(PresenceAction::Clear, force) {
-                debug!("clearing presence (idle_mode = clear)");
-                state.sink.clear();
-            } else if force {
-                // A refused *forced* send can only be the rate limit: force already skips the
-                // equality check and the minimum interval.
-                warn!("clear suppressed by the Discord rate limit; is an agent process flapping?");
-            }
-            if transition {
-                state.session_start_unix = None;
-                state.last_agent_id = agent_id;
-            }
-            state.first_tick = false;
-            sleep_interruptible(state.poll);
-            continue;
+    let outcome = match action {
+        PresenceAction::Set(view) => {
+            debug!(name = ?view.name, details = ?view.details, state = ?view.state, "pushing presence");
+            state.sink.set(view)
         }
+        PresenceAction::Clear => {
+            debug!("clearing presence");
+            state.sink.clear()
+        }
+    };
 
+    match outcome {
+        Ok(()) => {
+            state.debouncer.record_sent(action);
+            // Only announce a recovery if there was something to recover from, so the healthy path
+            // stays silent.
+            if state.backoff.consecutive_failures() > 0 {
+                info!(
+                    failures = state.backoff.consecutive_failures(),
+                    "Discord presence recovered"
+                );
+            }
+            state.backoff.record_success();
+        }
+        Err(e) => {
+            state.backoff.record_failure(now);
+            // Log the transition into failure, not every retry: with Discord closed all day this
+            // would otherwise be the daemon's main output, and the log file has no rotation.
+            if state.backoff.consecutive_failures() == 1 {
+                warn!(
+                    error = %format!("{e:#}"),
+                    retry_in_secs = state.backoff.retry_delay(Instant::now()).as_secs_f32(),
+                    "presence push failed; will keep retrying"
+                );
+            } else {
+                debug!(
+                    error = %format!("{e:#}"),
+                    failures = state.backoff.consecutive_failures(),
+                    "presence push still failing"
+                );
+            }
+        }
+    }
+}
+
+/// One iteration of the poll loop, minus the sleep.
+///
+/// Extracted from `run_forever` so the failure paths can be driven directly from tests, without
+/// subprocesses, signals, or touching the `RUNNING` static.
+fn tick(state: &mut RunState) {
+    let reloaded = maybe_reload_config(state);
+    refresh_processes(&mut state.sys, state.cfg.show_cwd_basename);
+
+    let candidates = collect_matches(&state.sys, &state.cfg);
+    let selected = winner_of(&candidates);
+
+    let agent_id = selected.as_ref().map(|(a, _)| a.id.clone());
+    let transition = agent_id != state.last_agent_id;
+    if transition {
+        debug!(?agent_id, candidates = candidates.len(), "agent transition");
+    }
+
+    let force = transition || state.first_tick || reloaded;
+    state.first_tick = false;
+
+    if selected.is_none() && state.cfg.idle_mode == IdleMode::Clear {
+        push(state, PresenceAction::Clear, force);
         if transition {
-            state.session_start_unix = selected.as_ref().map(|_| now_unix());
+            state.session_start_unix = None;
             state.last_agent_id = agent_id;
         }
+        return;
+    }
 
-        let cwd_hint = cwd_basename_for(
-            &state.sys,
-            &state.cfg,
-            selected.as_ref().map(|(_, pid)| *pid),
-        );
+    if transition {
+        state.session_start_unix = selected.as_ref().map(|_| now_unix());
+        state.last_agent_id = agent_id;
+    }
 
-        let bundle = devsignal_macos::frontmost_bundle_id();
+    let cwd_hint = cwd_basename_for(
+        &state.sys,
+        &state.cfg,
+        selected.as_ref().map(|(_, pid)| *pid),
+    );
 
-        let (view, policy) = build_policy_view(
-            &state.cfg,
-            selected.as_ref().map(|(a, _)| a),
-            bundle.as_deref(),
-            state.session_start_unix,
-            cwd_hint.as_deref(),
-            Some(local_minutes_now()),
-        );
+    let bundle = devsignal_macos::frontmost_bundle_id();
 
-        let force = transition || state.first_tick || reloaded;
-        if state
-            .debouncer
-            .should_send(PresenceAction::Set(&view), force)
-        {
-            debug!(
-                name = ?view.name,
-                details = ?view.details,
-                state = ?view.state,
-                matched_rule = ?policy.matched_rule_name,
-                "pushing presence"
-            );
-            state.sink.set(&view);
-        } else if force {
-            warn!(
-                details = ?view.details,
-                "presence update suppressed by the Discord rate limit; is an agent process flapping?"
-            );
-        }
+    let (view, policy) = build_policy_view(
+        &state.cfg,
+        selected.as_ref().map(|(a, _)| a),
+        bundle.as_deref(),
+        state.session_start_unix,
+        cwd_hint.as_deref(),
+        Some(local_minutes_now()),
+    );
+    debug!(matched_rule = ?policy.matched_rule_name, "policy applied");
 
-        state.first_tick = false;
+    push(state, PresenceAction::Set(&view), force);
+}
+
+fn run_forever(mut state: RunState) {
+    while RUNNING.load(Ordering::SeqCst) {
+        tick(&mut state);
         sleep_interruptible(state.poll);
     }
 
     // The one legitimate bypass of the debouncer: shutdown must always clear, rate limit or not.
-    // This is the whole point of trapping SIGTERM.
-    state.sink.clear();
+    // This is the whole point of trapping SIGTERM. Deliberately *not* routed through `push` — the
+    // backoff gate could skip it, and retrying would delay exit.
+    if let Err(e) = state.sink.clear() {
+        warn!(
+            error = %format!("{e:#}"),
+            "final clear failed; presence may be left stale in Discord"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -762,6 +847,213 @@ mod tests {
             small_text: None,
             buttons: vec![],
         }
+    }
+
+    /// A `RunState` wired to a test sink, pointing at a config path that does not exist.
+    ///
+    /// A missing config file is deliberate: `maybe_reload_config` reads its mtime as `None` on every
+    /// tick, which compares equal and so never triggers a reload. That keeps these tests about the
+    /// push path.
+    fn test_run_state(cfg: Config, sink: Box<dyn PresenceSink>, backoff: RetryBackoff) -> RunState {
+        RunState {
+            config_path: PathBuf::from("/nonexistent/devsignal-test-config.toml"),
+            config_mtime: None,
+            cfg,
+            sink,
+            sys: System::new(),
+            // Duration::ZERO so dedupe is governed by payload equality alone, not by timing.
+            debouncer: Debouncer::with_limits(Duration::ZERO, 100, Duration::from_secs(60)),
+            backoff,
+            last_agent_id: None,
+            session_start_unix: None,
+            poll: Duration::from_secs(1),
+            first_tick: true,
+        }
+    }
+
+    /// The regression test for the wedge. With a failing sink the payload was recorded as sent, so
+    /// tick 2 deduplicated against it and never called the sink again — quitting Discord killed
+    /// presence until the agent changed.
+    ///
+    /// Reverting the `record_sent`-on-success split makes this fail with exactly 1 attempt.
+    #[test]
+    fn a_failed_push_is_retried_on_a_later_tick() {
+        let (sink, log) = sink::ScriptedSink::new(&[false]);
+        let mut state = test_run_state(
+            test_config(""),
+            Box::new(sink),
+            RetryBackoff::new(Duration::ZERO, Duration::ZERO),
+        );
+
+        for _ in 0..3 {
+            tick(&mut state);
+        }
+
+        assert_eq!(
+            log.borrow().sets,
+            3,
+            "every tick must retry while the sink is failing"
+        );
+    }
+
+    /// The `idle_mode = "clear"` branch had the identical bug and is reached by a different path, so
+    /// it needs its own guard.
+    #[test]
+    fn a_failed_clear_is_retried_on_a_later_tick() {
+        let (sink, log) = sink::ScriptedSink::new(&[false]);
+        // No agent process named "definitely-not-running" exists, so the loop takes the idle branch.
+        let cfg: Config = toml::from_str(
+            "idle_mode = \"clear\"\n[discord]\nclient_id = \"1\"\n\n\
+             [[agents]]\nid = \"nope\"\nprocess_names = [\"definitely-not-running-xyzzy\"]\n",
+        )
+        .expect("test config parses");
+        let mut state = test_run_state(
+            cfg,
+            Box::new(sink),
+            RetryBackoff::new(Duration::ZERO, Duration::ZERO),
+        );
+
+        for _ in 0..3 {
+            tick(&mut state);
+        }
+
+        assert_eq!(log.borrow().clears, 3, "the clear path must retry too");
+        assert_eq!(log.borrow().sets, 0, "no agent matched, so nothing to set");
+    }
+
+    /// The failure mode the two-phase debouncer introduces: forget `record_sent` and the daemon writes
+    /// to Discord every single tick. An unchanged payload must still be sent exactly once.
+    #[test]
+    fn a_successful_push_is_still_debounced() {
+        let (sink, log) = sink::ScriptedSink::new(&[true]);
+        let mut state = test_run_state(test_config(""), Box::new(sink), RetryBackoff::default());
+
+        for _ in 0..3 {
+            tick(&mut state);
+        }
+
+        assert_eq!(
+            log.borrow().sets,
+            1,
+            "an unchanged view must be deduplicated after a confirmed send"
+        );
+    }
+
+    /// The shape none of the other retry tests cover: a **success followed by a failure**.
+    ///
+    /// Those tests all start with an always-failing sink, so `last_sent` stays `None` and the dedupe
+    /// equality check is never true. Once a send has landed, `last_sent` holds it — and since a failed
+    /// send records nothing, a later tick whose view equals that last *successful* payload gets
+    /// deduplicated against a payload Discord may never have received, freezing the retry loop.
+    ///
+    /// The view is varied by editing `brand_text`, which the `brand` line slot renders.
+    ///
+    /// Reverting the `recovering` bypass in `push` makes this fail with 2 sink calls instead of 3.
+    #[test]
+    fn a_failed_push_is_retried_even_when_the_view_matches_the_last_success() {
+        // Succeed once, then fail forever.
+        let (sink, log) = sink::ScriptedSink::new(&[true, false]);
+        let cfg = test_config("[presence]\nstate = \"brand\"\nbrand_text = \"A\"\n");
+        let mut state = test_run_state(
+            cfg,
+            Box::new(sink),
+            RetryBackoff::new(Duration::ZERO, Duration::ZERO),
+        );
+
+        // Tick 1 is forced (first tick) and succeeds, so view A becomes the dedupe key.
+        tick(&mut state);
+        assert_eq!(log.borrow().sets, 1, "the first send lands");
+
+        // The view changes to B and the send fails, so `last_sent` still holds A.
+        state.cfg.presence.brand_text = "B".into();
+        tick(&mut state);
+        assert_eq!(
+            log.borrow().sets,
+            2,
+            "the changed view is attempted and fails"
+        );
+
+        // Now the view returns to exactly A — the payload Discord last confirmed, but which it may have
+        // lost in the meantime. This must still be retried.
+        state.cfg.presence.brand_text = "A".into();
+        tick(&mut state);
+        assert_eq!(
+            log.borrow().sets,
+            3,
+            "a payload equal to the last success must still be retried while a failure is outstanding"
+        );
+    }
+
+    /// Case (b): nothing changes at all. Deduplication assumes Discord still shows the last payload, and
+    /// a Discord that quit and reopened has no way to say otherwise — so an unchanged view must be
+    /// re-asserted, or the daemon never even attempts a send to discover Discord was gone.
+    #[test]
+    fn an_unchanged_view_is_reasserted_so_a_restarted_discord_recovers() {
+        let (sink, log) = sink::ScriptedSink::new(&[true]);
+        let mut state = test_run_state(test_config(""), Box::new(sink), RetryBackoff::default());
+        state.debouncer = Debouncer::with_limits(Duration::ZERO, 100, Duration::from_secs(60))
+            .with_reassert_after(Duration::from_millis(120));
+
+        tick(&mut state);
+        assert_eq!(log.borrow().sets, 1);
+
+        // Inside the interval the payload stays deduplicated.
+        tick(&mut state);
+        assert_eq!(log.borrow().sets, 1, "still deduplicated");
+
+        std::thread::sleep(Duration::from_millis(150));
+        tick(&mut state);
+        assert_eq!(
+            log.borrow().sets,
+            2,
+            "past the re-assert interval an unchanged view goes out again"
+        );
+    }
+
+    /// Retrying is right; retrying every `poll_interval_secs` against a Discord that is simply closed
+    /// is not. A real backoff must collapse those ticks into one attempt.
+    #[test]
+    fn backoff_suppresses_retries_while_discord_is_down() {
+        let (sink, log) = sink::ScriptedSink::new(&[false]);
+        let mut state = test_run_state(
+            test_config(""),
+            Box::new(sink),
+            RetryBackoff::new(Duration::from_secs(10), Duration::from_secs(60)),
+        );
+
+        for _ in 0..5 {
+            tick(&mut state);
+        }
+
+        assert_eq!(
+            log.borrow().sets,
+            1,
+            "the first failure closes the gate for 10s, so the other four ticks skip"
+        );
+    }
+
+    /// Recovery needs no dedicated code path: once the sink works, whatever the current view is gets
+    /// published. This pins that down, including that the published view is the real one.
+    #[test]
+    fn presence_is_republished_after_the_sink_recovers() {
+        let (sink, log) = sink::ScriptedSink::new(&[false, false, true]);
+        let mut state = test_run_state(
+            test_config(""),
+            Box::new(sink),
+            RetryBackoff::new(Duration::ZERO, Duration::ZERO),
+        );
+
+        for _ in 0..3 {
+            tick(&mut state);
+        }
+
+        assert_eq!(log.borrow().sets, 3, "two failures then a success");
+        let views = &log.borrow().sent_views;
+        assert_eq!(views.len(), 1, "only the successful send is recorded");
+        assert!(
+            views[0].details.is_some() || views[0].name.is_some() || views[0].state.is_some(),
+            "the recovered send must carry a real payload, not an empty one"
+        );
     }
 
     /// `hide_host` has to survive both routes into it — a rule's `then`, and
