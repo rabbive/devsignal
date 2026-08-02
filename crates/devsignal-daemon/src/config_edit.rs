@@ -112,6 +112,7 @@ pub fn parse_agents_command(args: &[String]) -> Result<ConfigEditCommand> {
             "usage: devsignal agents list | enable <id> | disable <id> | remove <id> |\n\
              \x20      add --id <id> --process-name <name> [--label <text>] [--priority <n>]\n\
              \x20          [--large-image <key>] [--small-image <key>] [--small-text <text>]\n\
+             \x20          [--argv-substring <text>] [--exclude-argv-substring <text>]\n\
              \x20          [--button \"<label>=<url>\"]"
         ),
     }
@@ -124,6 +125,7 @@ fn parse_agent_add(args: &[String]) -> Result<AgentRule> {
     let mut label = None;
     let mut process_names = Vec::new();
     let mut argv_substrings = Vec::new();
+    let mut exclude_argv_substrings = Vec::new();
     let mut priority = None;
     let mut large_image = None;
     let mut small_image = None;
@@ -152,6 +154,10 @@ fn parse_agent_add(args: &[String]) -> Result<AgentRule> {
             }
             "--argv-substring" => {
                 argv_substrings.push(need_value("--argv-substring")?);
+                i += 2;
+            }
+            "--exclude-argv-substring" => {
+                exclude_argv_substrings.push(need_value("--exclude-argv-substring")?);
                 i += 2;
             }
             "--priority" => {
@@ -201,6 +207,7 @@ fn parse_agent_add(args: &[String]) -> Result<AgentRule> {
         label,
         process_names,
         argv_substrings,
+        exclude_argv_substrings,
         large_image,
         // Community presets start at 100 so they do not collide with the shipped band (10/20/30).
         priority: priority.unwrap_or(100),
@@ -614,6 +621,8 @@ mod tests {
             "gemini-cli",
             "--argv-substring",
             "gemini",
+            "--exclude-argv-substring",
+            "--background",
             "--priority",
             "105",
             "--large-image",
@@ -635,6 +644,7 @@ mod tests {
         assert_eq!(rule.label.as_deref(), Some("Gemini CLI"));
         assert_eq!(rule.process_names, vec!["gemini", "gemini-cli"]);
         assert_eq!(rule.argv_substrings, vec!["gemini"]);
+        assert_eq!(rule.exclude_argv_substrings, vec!["--background"]);
         assert_eq!(rule.priority, 105);
         assert_eq!(rule.large_image.as_deref(), Some("gemini_key"));
         assert_eq!(rule.small_text.as_deref(), Some("devsignal"));

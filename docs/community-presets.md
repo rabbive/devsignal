@@ -137,10 +137,9 @@ large_image   = "droid"
 basename, so `process_names = ["cline"]` never matches anything. Use `.cline`.
 
 **False-positive warning:** Cline also leaves a `.cline --cline-hub-daemon …` process running in the
-background after you stop using the CLI. Because `argv_substrings` can only *include*, there is no
-way to match the CLI while excluding the daemon — so this preset will show "Cline" whenever that
-daemon is alive. That is why it is not shipped as a default. Disable it with
-`devsignal agents disable cline` when it misfires.
+background after you stop using the CLI. The exclusion below keeps that helper from matching. If a
+future Cline version uses a different helper argument, disable it with
+`devsignal agents disable cline` until the preset is updated.
 
 ```toml
 [[agents]]
@@ -149,6 +148,7 @@ label         = "Cline"
 process_names = [".cline"]
 priority      = 180
 large_image   = "cline"
+exclude_argv_substrings = ["--cline-hub-daemon"]
 ```
 
 ### Goose

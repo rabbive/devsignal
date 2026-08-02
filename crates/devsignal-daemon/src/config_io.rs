@@ -140,6 +140,7 @@ mod tests {
             label: None,
             process_names: vec!["codex".into()],
             argv_substrings: vec![],
+            exclude_argv_substrings: vec![],
             large_image: None,
             priority: 20,
             small_image: None,

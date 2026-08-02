@@ -3,6 +3,13 @@
 All notable changes to devsignal. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver.
 
+## [Unreleased]
+
+### Fixed
+
+- Agent rules can exclude command-line substrings, preventing Claude Desktop from being detected as
+  Claude Code and preventing Cline's background hub daemon from keeping a false presence alive.
+
 ## [0.4.0] - 2026-07-28
 
 The presence-layout and art work had been sitting on `main` unreleased since 0.3.0. Shipping it turned
@@ -126,7 +133,6 @@ silently no longer doing its job.
 - `build_presence_view` takes a `PresenceInputs` struct, and the hidden-host fallback text (`Working`)
   moved from the daemon into core with the rest of the line rendering.
 - `PresenceView.details` / `.state` are now `Option<String>`, joined by a new `.name`.
-
 ## [0.3.0] - 2026-07-25
 
 First release since 0.2.0 (2026-04-19). Three features had been sitting on `main` unreleased for

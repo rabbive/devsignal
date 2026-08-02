@@ -110,7 +110,8 @@ Rust workspace, 4 crates under `crates/`:
    `everything()`, which also refreshed `environ`, `exe`, memory, CPU, and disk for every process.
 2. `collect_matches` runs `process_matches_rule` for each process × each `[[agents]]` rule
    (case-insensitive process name **or** `basename(argv[0])`, plus optional `argv_substrings`
-   against the joined command line). Rules disabled via `platforms.disabled_agents` are skipped
+   against the joined command line, then `exclude_argv_substrings` rejects known helpers/apps).
+   Rules disabled via `platforms.disabled_agents` are skipped
    here by `agent_allowed`. Threads are skipped (`thread_kind().is_some()`): on Linux sysinfo lists
    them as processes sharing the CLI's argv[0], so one agent would match many times. No-op on macOS.
 3. `select_active_agent` picks the winner by lowest `priority`, tie-breaking on lowest PID; returns
@@ -318,7 +319,7 @@ large_text  = "devsignal"
 # small_image / small_text — optional, used for the idle payload
 
 [[agents]]              # ≥1 required
-id = "claude_code"; label; process_names; argv_substrings
+id = "claude_code"; label; process_names; argv_substrings; exclude_argv_substrings
 priority = 100          # lower wins
 large_image; small_image; small_text
   [[agents.buttons]]    # max 2 reach Discord
