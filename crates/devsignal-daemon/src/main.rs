@@ -244,8 +244,8 @@ fn cmd_validate(config_path: &Path) -> Result<()> {
             if enabled { "" } else { "(disabled)" }
         );
         println!(
-            "             process_names={:?} argv_substrings={:?}",
-            a.process_names, a.argv_substrings
+            "             process_names={:?} argv_substrings={:?} exclude_argv_substrings={:?}",
+            a.process_names, a.argv_substrings, a.exclude_argv_substrings
         );
         println!(
             "             large_image={:?} small_image={:?} small_text={:?}",
@@ -426,8 +426,8 @@ fn cmd_detect(config_path: &Path, scope: DetectScope) -> Result<()> {
         for a in &cfg.agents {
             if agent_allowed(&cfg, Some(&a.id)) {
                 println!(
-                    "  {} — process_names={:?} argv_substrings={:?}",
-                    a.id, a.process_names, a.argv_substrings
+                    "  {} — process_names={:?} argv_substrings={:?} exclude_argv_substrings={:?}",
+                    a.id, a.process_names, a.argv_substrings, a.exclude_argv_substrings
                 );
             } else {
                 println!("  {} — (disabled via platforms.disabled_agents)", a.id);

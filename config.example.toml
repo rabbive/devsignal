@@ -65,6 +65,8 @@ large_text  = "devsignal"   # Hover tooltip for the idle large image.
 # process_names:   case-insensitive match against the sysinfo process name OR the
 #                  basename of argv[0] (catches wrapped CLIs like "node .../codex").
 # argv_substrings: narrow matches when non-empty — at least one must appear in the command line.
+# exclude_argv_substrings: reject a process when any of these appears in its command line. Useful for
+# excluding a desktop app or background helper that shares the CLI's process name.
 # priority:        lower number wins when multiple agents match; ties break on lower PID.
 #                  Presets are spaced by 10 so you can slot your own rules between them.
 # large_image /
@@ -90,6 +92,8 @@ priority      = 10
 large_image   = "claude_code"
 small_image   = "devsignal"
 small_text    = "devsignal"
+# Claude Desktop also exposes a process named "Claude"; exclude its app bundle from this CLI rule.
+exclude_argv_substrings = ["/Applications/Claude.app/"]
 
   [[agents.buttons]]
   label = "Claude Code Docs"

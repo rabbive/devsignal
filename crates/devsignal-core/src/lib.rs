@@ -332,6 +332,9 @@ pub struct AgentRule {
     /// If non-empty, require at least one of these substrings in the command line (case-insensitive).
     #[serde(default)]
     pub argv_substrings: Vec<String>,
+    /// If any of these substrings appears in the command line, reject the process (case-insensitive).
+    #[serde(default)]
+    pub exclude_argv_substrings: Vec<String>,
     /// Large image for this agent, resolved through [`ImagesConfig`] (falls back to global).
     #[serde(default)]
     pub large_image: Option<String>,
@@ -515,6 +518,7 @@ pub fn agent_presets() -> Vec<AgentRule> {
         id: &str,
         label: &str,
         process_names: &[&str],
+        exclude_argv_substrings: &[&str],
         priority: i32,
         button: Option<(&str, &str)>,
     ) -> AgentRule {
@@ -523,6 +527,10 @@ pub fn agent_presets() -> Vec<AgentRule> {
             label: Some(label.to_string()),
             process_names: process_names.iter().map(|s| s.to_string()).collect(),
             argv_substrings: vec![],
+            exclude_argv_substrings: exclude_argv_substrings
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             large_image: Some(id.to_string()),
             priority,
             small_image: Some("devsignal".to_string()),
@@ -543,6 +551,7 @@ pub fn agent_presets() -> Vec<AgentRule> {
             "claude_code",
             "Claude Code",
             &["claude", "claude-code"],
+            &["/Applications/Claude.app/"],
             10,
             Some(("Claude Code Docs", "https://claude.ai/code")),
         ),
@@ -550,6 +559,7 @@ pub fn agent_presets() -> Vec<AgentRule> {
             "codex",
             "Codex",
             &["codex"],
+            &[],
             20,
             Some(("Codex on GitHub", "https://github.com/openai/codex")),
         ),
@@ -557,13 +567,21 @@ pub fn agent_presets() -> Vec<AgentRule> {
             "opencode",
             "OpenCode",
             &["opencode"],
+            &[],
             30,
             Some(("OpenCode Docs", "https://opencode.ai")),
         ),
         // Confirmed on macOS: the CLI is a bash wrapper that ends in
         // `exec -a "$0" node .../index.js`, so the process *name* is `node` while `argv[0]` keeps
         // the wrapper path. It matches on the argv[0] basename, not the name.
-        preset("cursor_agent", "Cursor Agent", &["cursor-agent"], 40, None),
+        preset(
+            "cursor_agent",
+            "Cursor Agent",
+            &["cursor-agent"],
+            &[],
+            40,
+            None,
+        ),
     ]
 }
 
@@ -653,6 +671,22 @@ impl AgentRule {
             "agent {:?} has no process_names, so it can never match a process",
             self.id
         );
+        for exclude in &self.exclude_argv_substrings {
+            anyhow::ensure!(
+                !exclude.trim().is_empty(),
+                "agent {:?} has an empty exclude_argv_substrings entry",
+                self.id
+            );
+            anyhow::ensure!(
+                !self
+                    .argv_substrings
+                    .iter()
+                    .any(|include| include.eq_ignore_ascii_case(exclude)),
+                "agent {:?} includes and excludes the same argv substring {:?}",
+                self.id,
+                exclude
+            );
+        }
         anyhow::ensure!(
             self.buttons.len() <= MAX_BUTTONS,
             "agent {:?} declares {} buttons; Discord shows at most {}. \
@@ -1206,7 +1240,8 @@ pub fn apply_rules(cfg: &Config, ctx: &RuleContext<'_>) -> PresencePolicyOverrid
 
 /// Match a process against an agent rule: `process_names` vs process `name` (case-insensitive)
 /// or vs the **basename** of `cmd[0]` (for wrapped CLIs, e.g. `node …/codex.js`), then optional
-/// `argv_substrings` against the full command line (case-insensitive).
+/// `argv_substrings` against the full command line (case-insensitive). Any matching
+/// `exclude_argv_substrings` rejects the process after the include checks.
 pub fn process_matches_rule(name: &str, cmd: &[impl AsRef<OsStr>], rule: &AgentRule) -> bool {
     let name_l = name.to_lowercase();
     let name_hit = rule
@@ -1226,16 +1261,22 @@ pub fn process_matches_rule(name: &str, cmd: &[impl AsRef<OsStr>], rule: &AgentR
     if !name_hit && !argv0_hit {
         return false;
     }
-    if rule.argv_substrings.is_empty() {
-        return true;
-    }
     let joined = cmd
         .iter()
         .map(|s| s.as_ref().to_string_lossy())
         .collect::<Vec<_>>()
         .join(" ");
     let joined_l = joined.to_lowercase();
-    rule.argv_substrings
+    if !rule.argv_substrings.is_empty()
+        && !rule
+            .argv_substrings
+            .iter()
+            .any(|needle| joined_l.contains(&needle.to_lowercase()))
+    {
+        return false;
+    }
+    !rule
+        .exclude_argv_substrings
         .iter()
         .any(|needle| joined_l.contains(&needle.to_lowercase()))
 }
@@ -1437,6 +1478,7 @@ mod tests {
             label: None,
             process_names: vec!["claude".into()],
             argv_substrings: vec![],
+            exclude_argv_substrings: vec![],
             large_image: None,
             priority: 10,
             small_image: None,
@@ -1491,6 +1533,18 @@ mod tests {
         let msg = err_of(&cfg);
         assert!(msg.contains("process_names"), "got {msg}");
         assert!(msg.contains("never match"), "got {msg}");
+    }
+
+    #[test]
+    fn validate_rejects_empty_or_contradictory_argv_exclusions() {
+        let mut empty = valid_config();
+        empty.agents[0].exclude_argv_substrings = vec!["  ".into()];
+        assert!(err_of(&empty).contains("empty exclude_argv_substrings"));
+
+        let mut contradictory = valid_config();
+        contradictory.agents[0].argv_substrings = vec!["codex".into()];
+        contradictory.agents[0].exclude_argv_substrings = vec!["CODEX".into()];
+        assert!(err_of(&contradictory).contains("includes and excludes"));
     }
 
     #[test]
@@ -2294,6 +2348,7 @@ mod tests {
             label: None,
             process_names: vec![],
             argv_substrings: vec![],
+            exclude_argv_substrings: vec![],
             large_image: None,
             priority,
             small_image: None,
@@ -2698,6 +2753,53 @@ mod tests {
     }
 
     #[test]
+    fn claude_code_preset_excludes_claude_desktop() {
+        let rule = agent_presets()
+            .into_iter()
+            .find(|p| p.id == "claude_code")
+            .expect("claude_code preset must ship");
+        assert!(process_matches_rule(
+            "claude",
+            &[OsStr::new("/opt/homebrew/bin/claude")],
+            &rule
+        ));
+        assert!(!process_matches_rule(
+            "Claude",
+            &[
+                OsStr::new("/Applications/Claude.app/Contents/MacOS/Claude"),
+                OsStr::new("--no-sandbox"),
+            ],
+            &rule
+        ));
+    }
+
+    #[test]
+    fn cline_rule_excludes_background_hub_daemon() {
+        let rule = AgentRule {
+            id: "cline".into(),
+            label: Some("Cline".into()),
+            process_names: vec![".cline".into()],
+            argv_substrings: vec![],
+            exclude_argv_substrings: vec!["--cline-hub-daemon".into()],
+            large_image: None,
+            priority: 180,
+            small_image: None,
+            small_text: None,
+            buttons: vec![],
+        };
+        assert!(process_matches_rule(
+            ".cline",
+            &[OsStr::new(".cline"), OsStr::new("run")],
+            &rule
+        ));
+        assert!(!process_matches_rule(
+            ".cline",
+            &[OsStr::new(".cline"), OsStr::new("--cline-hub-daemon")],
+            &rule
+        ));
+    }
+
+    #[test]
     fn host_bundle_labels_include_hyper_tabby_wezterm() {
         assert!(HOST_APPS.iter().any(|a| a.bundle_id == "co.zeit.hyper"));
         assert!(HOST_APPS
@@ -2712,6 +2814,7 @@ mod tests {
             label: None,
             process_names: vec!["node".into()],
             argv_substrings: vec!["CODEX".into()],
+            exclude_argv_substrings: vec![],
             large_image: None,
             priority: 0,
             small_image: None,
@@ -2733,6 +2836,7 @@ mod tests {
             label: None,
             process_names: vec!["foo".into()],
             argv_substrings: vec![],
+            exclude_argv_substrings: vec![],
             large_image: None,
             priority: 0,
             small_image: None,
@@ -2750,6 +2854,7 @@ mod tests {
             label: None,
             process_names: vec!["codex".into()],
             argv_substrings: vec![],
+            exclude_argv_substrings: vec![],
             large_image: None,
             priority: 0,
             small_image: None,
@@ -2772,6 +2877,7 @@ mod tests {
             [[agents]]
             id = "test_agent"
             process_names = ["test"]
+            exclude_argv_substrings = ["desktop"]
             large_image = "test_icon"
             priority = 7
         "#;
@@ -2779,6 +2885,7 @@ mod tests {
         let rule = &cfg.agents[0];
         assert_eq!(rule.large_image.as_deref(), Some("test_icon"));
         assert_eq!(rule.priority, 7);
+        assert_eq!(rule.exclude_argv_substrings, vec!["desktop"]);
     }
 
     #[test]

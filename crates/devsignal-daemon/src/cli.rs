@@ -60,6 +60,7 @@ pub fn global_help() -> String {
            devsignal watch    [-c path]   Run the poll loop, printing instead of using Discord\n\
            devsignal hosts  list | enable <bundle_id> | disable <bundle_id>\n\
            devsignal agents list | enable <agent_id>  | disable <agent_id>\n\
+           devsignal agents add --id <id> --process-name <name> [agent options]\n\
            devsignal rules  list | remove <name> | add --name <name> [rule flags]\n\
            devsignal help | --help | -h\n\
            devsignal version | --version | -V\n\
@@ -72,6 +73,12 @@ pub fn global_help() -> String {
            --wait-for-discord      Retry until Discord is available (default)\n\
            --no-wait-for-discord   Fail immediately if Discord IPC is unavailable\n\
          \n\
+         Agent flags (devsignal agents add):\n\
+           --id <id>                Agent id (required)\n\
+           --process-name <name>    Process name; repeatable (required)\n\
+           --argv-substring <text>  Require text in the command line; repeatable\n\
+           --exclude-argv-substring <text>\n\
+                                    Reject a command line containing text; repeatable\n\
          Rule flags (devsignal rules add):\n\
            --name <name>           Rule name (required)\n\
            --host <bundle_id>      Match this frontmost host; repeatable\n\
@@ -338,6 +345,7 @@ mod tests {
         // The rule flags must be documented; they previously existed only in the README.
         assert!(global_help().contains("--hide-host"));
         assert!(global_help().contains("--time <HH:MM-HH:MM>"));
+        assert!(global_help().contains("--exclude-argv-substring <text>"));
         assert!(global_help().contains("detect"));
         assert!(global_help().contains("watch"));
     }

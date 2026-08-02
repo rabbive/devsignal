@@ -211,7 +211,7 @@ rule's `hide_host` — hides the icon too, so the app cannot leak through its im
 - `min_push_interval_secs`: minimum time between Discord presence updates unless the active agent changes (reduces flicker and rate limits).
 - `idle_mode`: `status` (default) shows an idle line when no agent is detected; `clear` calls Discord **CLEAR_ACTIVITY** so nothing is shown for this application.
 - `show_cwd_basename`: when `true`, appends the **basename only** of the winning agent process working directory (never full paths). Off by default for privacy.
-- `[[agents]]`: `process_names` match **case-insensitively** against the `sysinfo` process name **or** the **basename of argv0** (so wrapped CLIs like `node …/codex` can match `codex`). Optional `argv_substrings` narrow matches when non-empty — **at least one** must appear in the command line (case-insensitive).
+- `[[agents]]`: `process_names` match **case-insensitively** against the `sysinfo` process name **or** the **basename of argv0** (so wrapped CLIs like `node …/codex` can match `codex`). Optional `argv_substrings` narrow matches when non-empty — **at least one** must appear in the command line (case-insensitive). Optional `exclude_argv_substrings` rejects a process when any excluded text appears, which prevents desktop apps or background helpers from matching a CLI rule.
 - `priority`: **lower number wins** when multiple agents match.
 - `[presence]`: which of Discord's three lines carries the agent, host, project, or brand text — see [What the card shows](#what-the-card-shows).
 - `[images]`: `mode = "url"` resolves image names to hosted PNGs under `base_url`; `mode = "key"` treats them as uploaded art-asset keys. `host_icon` puts the frontmost editor/terminal in the small corner slot.
@@ -338,7 +338,7 @@ CI runs **fmt** and **clippy** (Linux exercises Linux-safe crates; macOS runs th
 | Area | Today | Natural next step |
 | --- | --- | --- |
 | Host OS | macOS-only host code in `devsignal-macos` | Separate crate + shared traits in core for other platforms |
-| Agents | TOML `process_names` / `argv_substrings` | More rules or config reload |
+| Agents | TOML `process_names` / argv include and exclude substrings | More verified presets or matching fixtures |
 | Discord | Local IPC to desktop client | Unchanged for Rich Presence; assets stay in the Developer Portal |
 | Distribution | Unsigned release binary in CI | Optional `codesign` / `notarytool` for Gatekeeper-friendly installs |
 
